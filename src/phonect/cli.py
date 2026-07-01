@@ -11,11 +11,18 @@ Usage::
 
     # Run as mobile emulator (connects to PC)
     phonect client <private_key.pem> <pc_ip> <pc_port>
+
+    # Run the system daemon
+    phonect daemon [--config <path>] [--foreground]
+
+    # Initialise a config template
+    phonect init-config [--path <path>]
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import sys
 from pathlib import Path
@@ -98,6 +105,27 @@ def cmd_client(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def cmd_daemon(args: argparse.Namespace) -> None:
+    """Run the system daemon (D-Bus / poll / unlock)."""
+    from phonect.daemon import run_daemon
+
+    asyncio.run(run_daemon(
+        config_path=Path(args.config) if args.config else None,
+        foreground=args.foreground,
+    ))
+
+
+def cmd_init_config(args: argparse.Namespace) -> None:
+    """Write a default config.toml template."""
+    from phonect.config import write_default_config
+
+    target = Path(args.path) if args.path else None
+    written = write_default_config(target)
+    print(f"✓ Config template written to: {written}")
+    print(f"  Edit it to set your mobile IP and public key path, then run:")
+    print(f"    phonect daemon")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="phonect",
@@ -127,6 +155,17 @@ def main() -> None:
     cl.add_argument("--device-name", default="android-emulator")
     cl.add_argument("--timeout", type=float, default=10.0)
     cl.set_defaults(func=cmd_client)
+
+    # daemon (system service)
+    dm = sub.add_parser("daemon", help="Run the background unlock daemon")
+    dm.add_argument("--config", help="Path to config.toml (default: ~/.config/phonect/config.toml)")
+    dm.add_argument("--foreground", action="store_true", help="Log to stderr instead of syslog")
+    dm.set_defaults(func=cmd_daemon)
+
+    # init-config
+    ic = sub.add_parser("init-config", help="Write a default config.toml template")
+    ic.add_argument("--path", help="Output path (default: ~/.config/phonect/config.toml)")
+    ic.set_defaults(func=cmd_init_config)
 
     args = parser.parse_args()
     args.func(args)

@@ -43,11 +43,15 @@ phonect/
 │   ├── crypto.py           # RSA-4096: генерация ключей, Nonce, подпись, верификация
 │   ├── protocol.py         # Сетевой протокол (JSON length-prefixed frames)
 │   ├── handshake.py        # Оркестрация handshake (PC server + mobile client)
-│   └── cli.py              # TUI/CLI для разработки и тестирования
+│   ├── daemon.py           # 🆕 Фоновый asyncio-демон (D-Bus, poll, unlock)
+│   ├── config.py           # 🆕 Конфигурация (TOML, ~/.config/phonect/)
+│   └── cli.py              # CLI: gen-keys, server, client, daemon, init-config
+├── phonect-service.nix     # 🆕 NixOS модуль: systemd service + опции
 ├── scripts/
 │   └── e2e_cli_test.py     # End-to-end интеграционный тест
 ├── tests/
-│   └── test_handshake.py   # Unit-тесты handshake
+│   ├── test_handshake.py   # Unit-тесты handshake
+│   └── test_daemon.py      # 🆕 Тесты демона (config, session, async handshake)
 └── pyproject.toml
 ```
 
@@ -83,13 +87,49 @@ python scripts/e2e_cli_test.py
 | `phonect gen-keys` | Генерация RSA-4096 ключей |
 | `phonect server <pubkey>` | Запуск ПК-сервера (ожидает мобилку) |
 | `phonect client <privkey> <ip> <port>` | Эмуляция Android-клиента |
+| `phonect daemon` | 🆕 Запуск фонового демона (D-Bus + poll + unlock) |
+| `phonect init-config` | 🆕 Создать шаблон config.toml |
 
 ## План реализации
 
 - [x] **Шаг 1**: Прототип криптографического handshake (RSA-4096, Nonce, подпись, верификация) — **готов**
-- [ ] **Шаг 2**: Фоновый демон для Linux с интеграцией `systemd-logind` и `suspend.target`
+- [x] **Шаг 2**: Фоновый демон для Linux с интеграцией `systemd-logind` и `suspend.target` — **готов**
 - [ ] **Шаг 3**: Android-приложение (Keystore, BiometricPrompt, сетевой сокет)
 - [ ] **Шаг 4**: TUI-конфигуратор с QR-кодом и менеджером устройств
+
+## Демон (Шаг 2)
+
+Фоновый демон (`phonect daemon`) интегрируется с `systemd-logind` через D-Bus:
+
+1. **D-Bus listener**: подписывается на сигнал `PrepareForSleep` от `org.freedesktop.login1.Manager`.
+2. **При wakeup** (PrepareForSleep=false): запускает агрессивный цикл опроса — пытается соединиться с телефоном каждые 200 мс в течение 10 секунд.
+3. **При успешном соединении**: выполняется Challenge-Response handshake.
+4. **При успешной верификации**: `loginctl unlock-session <id>` для всех активных сессий пользователя.
+5. **SIGUSR1**: ручной триггер цикла аутентификации (без сна).
+
+### NixOS модуль
+
+Файл `phonect-service.nix` — готовый NixOS-модуль для включения в конфигурацию:
+
+```nix
+{
+  imports = [ ./phonect-service.nix ];
+
+  services.phonect = {
+    enable = true;
+    user = "zumuvik";
+    mobileIp = "192.168.1.100";
+    mobilePort = 9876;
+    publicKey = "/var/lib/phonect/trusted_device.pub";
+  };
+}
+```
+
+Модуль автоматизирует:
+- Сборку Python-пакета с зависимостями (`cryptography`, `dbus-next`)
+- Генерацию config.toml из опций
+- Systemd-сервис с security hardening
+- Запуск сервиса после `network.target` и `suspend.target`
 
 ## Требования
 
