@@ -1,6 +1,9 @@
 # phonect — P2P Biometric Laptop Unlock
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/zumuvik/phonect/actions/workflows/tests.yml/badge.svg)](https://github.com/zumuvik/phonect/actions/workflows/tests.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](pyproject.toml)
+[![Kotlin](https://img.shields.io/badge/kotlin-1.9%2B-purple)](android/)
 
 **phonect** (phone + connect) — система бесшовной разблокировки Linux-ноутбука с помощью сканера отпечатков пальцев на Android-смартфоне. Связь между устройствами осуществляется напрямую (P2P) по локальной сети Wi-Fi, без сторонних облачных серверов.
 
@@ -41,18 +44,30 @@ phonect/
 ├── src/phonect/
 │   ├── __init__.py         # Пакет
 │   ├── crypto.py           # RSA-4096: генерация ключей, Nonce, подпись, верификация
-│   ├── protocol.py         # Сетевой протокол (JSON length-prefixed frames)
-│   ├── handshake.py        # Оркестрация handshake (PC server + mobile client)
-│   ├── daemon.py           # 🆕 Фоновый asyncio-демон (D-Bus, poll, unlock)
-│   ├── config.py           # 🆕 Конфигурация (TOML, ~/.config/phonect/)
+│   ├── protocol.py         # Сетевой протокол (JSON length-prefixed frames, 64KB limit)
+│   ├── handshake.py        # Оркестрация handshake (PC + mobile, mutual-auth skeleton)
+│   ├── daemon.py           # Фоновый asyncio-демон (D-Bus logind, poll, unlock)
+│   ├── config.py           # Конфигурация (TOML, ~/.config/phonect/)
 │   └── cli.py              # CLI: gen-keys, server, client, daemon, init-config
-├── phonect-service.nix     # 🆕 NixOS модуль: systemd service + опции
+├── android/                # 📱 Android-приложение (Kotlin)
+│   └── app/src/main/java/com/phonect/android/
+│       ├── crypto/CryptoManager.kt      # RSA-4096 в Android Keystore + биометрия
+│       ├── network/PhonectNetworkService.kt  # Foreground Service TCP listener
+│       ├── network/ProtocolHandler.kt   # Парсинг фреймов (64KB limit)
+│       ├── biometric/BiometricHandler.kt     # BiometricPrompt wrapper
+│       ├── model/HandshakeModels.kt     # Data-классы сообщений
+│       └── ui/MainActivity.kt           # UI управления сервисом
+├── phonect-service.nix     # ❄️ NixOS модуль: systemd service + Polkit + hardening
 ├── scripts/
 │   └── e2e_cli_test.py     # End-to-end интеграционный тест
 ├── tests/
 │   ├── test_handshake.py   # Unit-тесты handshake
-│   └── test_daemon.py      # 🆕 Тесты демона (config, session, async handshake)
-└── pyproject.toml
+│   └── test_daemon.py      # Тесты демона (config, session, async handshake)
+├── .github/workflows/
+│   └── tests.yml           # CI: pytest при каждом пуше
+├── SECURITY.md             # Threat model
+├── CONTRIBUTING.md         # Правила для контрибьюторов
+└── LICENSE                 # MIT
 ```
 
 ## Быстрый старт (Шаг 1 — прототип)
@@ -94,7 +109,11 @@ python scripts/e2e_cli_test.py
 
 - [x] **Шаг 1**: Прототип криптографического handshake (RSA-4096, Nonce, подпись, верификация) — **готов**
 - [x] **Шаг 2**: Фоновый демон для Linux с интеграцией `systemd-logind` и `suspend.target` — **готов**
-- [ ] **Шаг 3**: Android-приложение (Keystore, BiometricPrompt, сетевой сокет)
+- [x] **Шаг 3**: Android-приложение (Keystore, BiometricPrompt, Foreground Service) — **готов**
+  - `CryptoManager.kt` — RSA-4096 в Android Keystore с BIOMETRIC_STRONG
+  - `PhonectNetworkService.kt` — Foreground Service, TCP listener, Wi-Fi awareness
+  - `BiometricHandler.kt` — BiometricPrompt интеграция
+  - `ProtocolHandler.kt` — парсинг фреймов phonect.protocol
 - [ ] **Шаг 4**: TUI-конфигуратор с QR-кодом и менеджером устройств
 
 ## Демон (Шаг 2)

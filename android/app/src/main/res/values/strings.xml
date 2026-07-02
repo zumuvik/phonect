@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">phonect</string>
+    <string name="channel_name">phonect Service</string>
+    <string name="channel_description">TCP listener for laptop unlock requests</string>
+    <string name="notification_listening">Listening for unlock requests</string>
+    <string name="notification_authenticating">Authenticating…</string>
+    <string name="btn_start_service">Start Service</string>
+    <string name="btn_stop_service">Stop Service</string>
+    <string name="status_listening">Listening on port %d</string>
+    <string name="status_stopped">Service stopped</string>
+    <string name="label_paired_pcs">Paired PCs</string>
+</resources>

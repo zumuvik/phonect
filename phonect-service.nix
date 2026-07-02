@@ -23,12 +23,6 @@
 let
   cfg = config.services.phonect;
 
-  pythonEnv = pkgs.python3.withPackages (ps: with ps; [
-    cryptography
-    dbus-next
-    # phonect itself — either from nixpkgs or a local source
-  ]);
-
   phonectSrc = lib.cleanSourceWith {
     src = lib.cleanSource ./.;
     name = "phonect-source";
@@ -70,8 +64,20 @@ in {
 
     user = lib.mkOption {
       type = lib.types.str;
-      default = "root";
-      description = "User to run the daemon as (must own the session to unlock).";
+      default = "";
+      example = "zumuvik";
+      description = ''
+        Unprivileged user to run the daemon as.
+        Must own the login session so that ``loginctl unlock-session`` works.
+        If empty, you must set ``systemd.services.phonect.serviceConfig.User``
+        yourself.
+      '';
+    };
+
+    group = lib.mkOption {
+      type = lib.types.str;
+      default = "phonect";
+      description = "Group for the phonect daemon.";
     };
 
     mobileIp = lib.mkOption {
@@ -125,17 +131,39 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
-    # Ensure the public key exists before the service starts
+    # ── Group & user ──────────────────────────────────────────────────────
+    users.groups.phonect = lib.mkIf (cfg.group == "phonect") {};
+
+    users.users.phonect = lib.mkIf (cfg.user == "" && cfg.group == "phonect") {
+      description = "phonect daemon user";
+      group = cfg.group;
+      isSystemUser = true;
+      home = "/var/lib/phonect";
+      createHome = true;
+    };
+
+    # ── Polkit: allow the phonect user to unlock login sessions ──────────
+    security.polkit.extraPolicies = ''
+      polkit.addRule(function(action, subject) {
+        if (action.id == "org.freedesktop.login1.unlock-session" ||
+            action.id == "org.freedesktop.login1.unlock-sessions") {
+          if (subject.user == "${cfg.user}") {
+            return polkit.Result.YES;
+          }
+        }
+      });
+    '';
+
+    # ── Ensure the public key directory exists ──────────────────────────
     systemd.tmpfiles.rules = [
-      "d /var/lib/phonect 0755 ${cfg.user} root -"
+      "d /var/lib/phonect 0750 ${cfg.user} ${cfg.group} -"
     ];
 
+    # ── Main service ────────────────────────────────────────────────────
     systemd.services.phonect = {
       description = "phonect P2P Biometric Laptop Unlock Daemon";
       after = [ "network.target" "suspend.target" "hibernate.target" "hybrid-sleep.target" ];
       wantedBy = [ "multi-user.target" ];
-
-      # Bind to the resume-from-sleep path
       partOf = [ "suspend.target" "hibernate.target" "hybrid-sleep.target" ];
       before = [ "sleep.target" ];
 
@@ -145,10 +173,14 @@ in {
         Restart = "on-failure";
         RestartSec = 5;
 
-        # Run as the target user so loginctl works for their session
-        User = cfg.user;
+        # ── Run as unprivileged user (never root) ─────────────────────
+        User = lib.mkIf (cfg.user != "") cfg.user;
+        Group = cfg.group;
 
-        # Security hardening
+        # ── D-Bus: system bus for logind signals ──────────────────────
+        BusName = "";
+
+        # ── Security hardening ────────────────────────────────────────
         CapabilityBoundingSet = [ "" ];
         DevicePolicy = "closed";
         NoNewPrivileges = true;
@@ -156,27 +188,27 @@ in {
         PrivateTmp = true;
         ProtectSystem = "strict";
         ProtectHome = "read-only";
-        ReadWritePaths = [
-          # Config directory (public key can be updated at runtime)
-          "/var/lib/phonect"
-        ];
-
-        # D-Bus access (system bus for logind signals)
-        BusName = "";
-
-        # Allow talking to systemd-logind over D-Bus
+        RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+        RestrictNamespaces = true;
+        SystemCallArchitectures = "native";
         SystemCallFilter = [ "@system-service" ];
-      };
 
-      unitConfig = {
-        # Stop the daemon cleanly before suspend
-        StopWhenUnneeded = false;
-      };
-    };
+        # Allow outbound TCP to the phone and inbound logind D-Bus
+        IPAddressAllow = [
+          "127.0.0.0/8"
+          "10.0.0.0/8"
+          "172.16.0.0/12"
+          "192.168.0.0/16"
+          "169.254.0.0/16"
+        ];
+        IPAddressDeny = [ "0.0.0.0/0" ];
 
-    # Also expose the public key path as an environment hint
-    environment.etc = lib.mkIf (cfg.publicKey != "") {
-      "phonect/public_key".source = cfg.publicKey;
+        # Read-write for config/key updates
+        ReadWritePaths = [
+          "/var/lib/phonect"
+          (builtins.toString cfg.publicKey)
+        ];
+      };
     };
   };
 }

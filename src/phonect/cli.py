@@ -72,7 +72,7 @@ def cmd_server(args: argparse.Namespace) -> None:
 def cmd_client(args: argparse.Namespace) -> None:
     """Run as mobile emulator client."""
 
-    def biometric_prompt(_nonce: bytes) -> bool:
+    def biometric_prompt(_nonce: bytes, _challenge: dict) -> bool:
         """Simulate Android biometric dialogue."""
         print("\n  [Simulating BiometricPrompt — fingerprint scan OK]\n")
         return True

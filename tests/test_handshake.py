@@ -47,7 +47,7 @@ def test_full_handshake() -> None:
         connect_timeout=5.0,
     )
 
-    def biometric_ok(_nonce: bytes) -> bool:
+    def biometric_ok(_nonce: bytes, _challenge: dict) -> bool:
         return True
 
     client_ok = client.do_handshake(
@@ -98,7 +98,7 @@ def test_handshake_wrong_key() -> None:
         connect_timeout=5.0,
     )
 
-    def biometric_ok(_nonce: bytes) -> bool:
+    def biometric_ok(_nonce: bytes, _challenge: dict) -> bool:
         return True
 
     client_ok = client.do_handshake("127.0.0.1", port, biometric_ok)
@@ -144,7 +144,7 @@ def test_biometric_decline() -> None:
         connect_timeout=5.0,
     )
 
-    def biometric_decline(_nonce: bytes) -> bool:
+    def biometric_decline(_nonce: bytes, _challenge: dict) -> bool:
         return False  # User declined
 
     client_ok = client.do_handshake("127.0.0.1", port, biometric_decline)
