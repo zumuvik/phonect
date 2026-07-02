@@ -94,7 +94,8 @@ class PhonectDaemon:
 
         # Load the PC private key for mutual authentication
         self._pc_private_key: Optional[rsa.RSAPrivateKey] = None
-        if config.private_key_path.exists():
+        pk_path = config.private_key_path
+        if pk_path and pk_path.is_file():
             try:
                 self._pc_private_key = load_private_key(config.pc_private_key_pem)
                 LOG.info("PC private key loaded for mutual auth")
@@ -497,11 +498,16 @@ async def run_daemon(
     _configure_logging(config.log_level)
 
     if not config.valid:
+        pk_status = (
+            str(config.public_key_path)
+            if config.public_key_path.exists() and config.public_key_path.is_file()
+            else "MISSING"
+        )
         LOG.warning(
             "Config incomplete (mobile_ip=%r, public_key=%s). "
             "Run 'phonect init-config' to create a template.",
             config.mobile_ip,
-            config.public_key_path if config.public_key_path.exists() else "MISSING",
+            pk_status,
         )
 
     daemon = PhonectDaemon(config)

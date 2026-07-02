@@ -37,6 +37,8 @@ let
     propagatedBuildInputs = with pkgs.python3.pkgs; [
       cryptography
       dbus-next
+      textual
+      qrcode
     ];
     doCheck = false;
   };
@@ -48,6 +50,7 @@ let
 
     [keys]
     public_key = "${cfg.publicKey}"
+    private_key = "/var/lib/phonect/pc_private.pem"
 
     [daemon]
     poll_interval_ms = ${toString cfg.pollIntervalMs}
@@ -143,7 +146,7 @@ in {
     };
 
     # ── Polkit: allow the phonect user to unlock login sessions ──────────
-    security.polkit.extraPolicies = ''
+    security.polkit.extraConfig = ''
       polkit.addRule(function(action, subject) {
         if (action.id == "org.freedesktop.login1.unlock-session" ||
             action.id == "org.freedesktop.login1.unlock-sessions") {
@@ -176,9 +179,6 @@ in {
         # ── Run as unprivileged user (never root) ─────────────────────
         User = lib.mkIf (cfg.user != "") cfg.user;
         Group = cfg.group;
-
-        # ── D-Bus: system bus for logind signals ──────────────────────
-        BusName = "";
 
         # ── Security hardening ────────────────────────────────────────
         CapabilityBoundingSet = [ "" ];

@@ -58,10 +58,10 @@ class DaemonConfig:
 
     # PC identity
     pc_name: str = ""
-    private_key_path: Path = field(default_factory=lambda: Path())
+    private_key_path: Path = field(default_factory=lambda: Path("/nonexistent"))
 
     # Keys
-    public_key_path: Path = field(default_factory=lambda: Path())
+    public_key_path: Path = field(default_factory=lambda: Path("/nonexistent"))
 
     # Behaviour
     poll_interval: float = DEFAULT_POLL_INTERVAL_MS / 1000.0
