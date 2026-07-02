@@ -41,7 +41,7 @@ let
 
   phonectPackage = pkgs.python3.pkgs.buildPythonPackage rec {
     pname = "phonect";
-    version = "0.3.0";
+    version = "0.3.1";
     src = phonectSrc;
     pyproject = true;
     buildInputs = [ pkgs.python3.pkgs.setuptools ];
@@ -157,6 +157,9 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
+    # ── Firewall: allow phone to connect inbound ───────────────────────
+    networking.firewall.allowedTCPPorts = [ cfg.settings.daemon.listen_port ];
+
     # ── Make the phonect CLI available in PATH ──────────────────────────
     environment.systemPackages = [ cfg.package ];
 

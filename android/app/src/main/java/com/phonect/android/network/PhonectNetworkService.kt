@@ -66,6 +66,7 @@ class PhonectNetworkService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var listenJob: Job? = null
     private var udpSocket: DatagramSocket? = null
+    private val connectingTo = mutableSetOf<String>()  // debounce: IPs we're already connecting to
 
     private lateinit var cryptoManager: CryptoManager
     private lateinit var prefs: SharedPreferences
@@ -213,6 +214,8 @@ class PhonectNetworkService : Service() {
     // ------------------------------------------------------------------
 
     private suspend fun connectToPc(pcIp: String, port: Int, pcName: String) {
+        // Debounce: skip if already connecting to this IP
+        if (!connectingTo.add(pcIp)) return
         var socket: Socket? = null
         try {
             LogManager.i(TAG, "Connecting to $pcIp:$port ...")
@@ -325,7 +328,7 @@ class PhonectNetworkService : Service() {
             // ── Step 7: Send response ────────────────────────────────
             val response = ResponseMessage(
                 session_id = challenge.session_id,
-                signature = signedBytes.toHex(),
+                signature = signedBytes.joinToString("") { "%02x".format(it) },
                 public_key_fingerprint = pubKeyFp,
                 device_name = Build.MODEL,
             )
@@ -341,6 +344,7 @@ class PhonectNetworkService : Service() {
         } catch (e: Exception) {
             LogManager.e(TAG, "Unexpected error with $pcIp", e)
         } finally {
+            connectingTo.remove(pcIp)
             try { socket?.close() } catch (_: Exception) {}
         }
     }

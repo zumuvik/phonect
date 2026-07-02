@@ -17,7 +17,7 @@ import java.nio.ByteBuffer
 
 object ProtocolHandler {
 
-    private val gson = Gson()
+    @PublishedApi internal val gson = Gson()
 
     /** Encode any message into a length-prefixed frame. */
     fun encodeFrame(obj: Any): ByteArray {
@@ -98,7 +98,7 @@ object ProtocolHandler {
     // ------------------------------------------------------------------
 
     /** Read exactly [n] bytes from [inputStream], or return null on EOF. */
-    private fun readExactly(inputStream: InputStream, buffer: ByteArray): ByteArray? {
+    @PublishedApi internal fun readExactly(inputStream: InputStream, buffer: ByteArray): ByteArray? {
         var offset = 0
         while (offset < buffer.size) {
             val read = inputStream.read(buffer, offset, buffer.size - offset)
