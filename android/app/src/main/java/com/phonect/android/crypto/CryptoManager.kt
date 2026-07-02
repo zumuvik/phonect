@@ -1,10 +1,9 @@
 package com.phonect.android.crypto
 
 import android.security.keystore.*
+import androidx.biometric.BiometricPrompt
 import java.security.*
-import java.security.spec.MGF1ParameterSpec
 import java.security.spec.PSSParameterSpec
-import javax.crypto.Cipher
 
 /**
  * Manages RSA-4096 key pair generation and signing via Android Hardware-backed
@@ -16,12 +15,17 @@ import javax.crypto.Cipher
  * - `setUserAuthenticationValidityDurationSeconds(-1)` — must re-auth per use
  * - `setIsStrongBoxBacked(true)` — prefer StrongBox / TEE if available
  *
- * Usage:
+ * Usage (biometric-bound signing):
  * ```kotlin
  * val crypto = CryptoManager(context)
- * crypto.generateKeyIfNeeded("phonect_key")
- * // ... later, inside BiometricPrompt success callback:
- * val signature = crypto.sign("phonect_key", nonceBytes)
+ * crypto.generateKeyIfNeeded()
+ *
+ * // Inside the biometric flow:
+ * val signature = crypto.getInitializedSignature()
+ * val cryptoObj = BiometricPrompt.CryptoObject(signature)
+ * // → pass to BiometricPrompt.authenticate(promptInfo, cryptoObj)
+ * // → on success, extract Signature from result.cryptoObject.signature
+ * // → signature.update(nonce); val signed = signature.sign()
  * ```
  */
 class CryptoManager(private val appContext: android.content.Context) {
@@ -31,9 +35,7 @@ class CryptoManager(private val appContext: android.content.Context) {
         const val KEY_SIZE = 4096
         const val SIGNATURE_ALGORITHM = "SHA512withRSA/PSS"
         const val PROVIDER = "AndroidKeyStore"
-        const val DIGEST = "SHA-512"
 
-        /** Hex characters for fingerprint computation. */
         private val HEX_CHARS = "0123456789abcdef".toCharArray()
     }
 
@@ -72,7 +74,6 @@ class CryptoManager(private val appContext: android.content.Context) {
             .setInvalidatedByBiometricEnrollment(true)           // new finger = key gone
             // Hardware binding ----------------------------------------------------
             .setIsStrongBoxBacked(true)                          // prefer StrongBox/TEE
-            // Key is not used for encryption, so no need for purposes other than SIGN
             .build()
 
         keyGen.initialize(spec)
@@ -80,28 +81,32 @@ class CryptoManager(private val appContext: android.content.Context) {
     }
 
     // ------------------------------------------------------------------
-    // Signing
+    // Biometric-bound signing (CryptoObject flow)
     // ------------------------------------------------------------------
 
     /**
-     * Sign [data] with the private key identified by [alias].
+     * Create and initialize a [Signature] instance bound to the Keystore
+     * private key.
      *
-     * **Must be called inside a BiometricPrompt success callback**
-     * (i.e. after the user has authenticated), otherwise the Keystore
-     * will throw [KeyStoreException] / [UserNotAuthenticatedException].
+     * The returned [Signature] is already in "sign" mode (``initSign`` called).
+     * Wrap it in [BiometricPrompt.CryptoObject] and pass to
+     * ``prompt.authenticate(promptInfo, cryptoObject)``.
+     *
+     * After successful biometric auth, extract the validated Signature
+     * from ``result.cryptoObject.signature``, call ``update(nonce)`` and
+     * ``sign()`` to produce the final signature.
      *
      * @param alias key alias in Android Keystore.
-     * @param data bytes to sign (the 32-byte nonce).
-     * @return RSA-PSS/SHA-512 signature bytes.
+     * @return initialized [Signature] ready to be wrapped in CryptoObject.
+     * @throws KeyStoreException if the key does not exist or is inaccessible.
+     * @throws UnrecoverableKeyException if the key cannot be retrieved.
      */
-    fun sign(alias: String = KEY_ALIAS, data: ByteArray): ByteArray {
+    @Throws(KeyStoreException::class, UnrecoverableKeyException::class, NoSuchAlgorithmException::class)
+    fun getInitializedSignature(alias: String = KEY_ALIAS): Signature {
         val privateKey = (keyStore.getEntry(alias, null) as KeyStore.PrivateKeyEntry).privateKey
         val signature = Signature.getInstance(SIGNATURE_ALGORITHM)
-
-        // Configure PSS parameters: salt = hash length (max)
         signature.initSign(privateKey)
-        signature.update(data)
-        return signature.sign()
+        return signature
     }
 
     // ------------------------------------------------------------------
@@ -154,7 +159,7 @@ class CryptoManager(private val appContext: android.content.Context) {
     }
 
     // ------------------------------------------------------------------
-    // Key attestation (optional — for future device binding)
+    // Key attestation (optional)
     // ------------------------------------------------------------------
 
     /**

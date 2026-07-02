@@ -4,6 +4,7 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.SharedPreferences
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -11,10 +12,13 @@ import android.net.NetworkRequest
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import androidx.biometric.BiometricPrompt
 import androidx.core.app.NotificationCompat
 import com.phonect.android.biometric.BiometricHandler
 import com.phonect.android.crypto.CryptoManager
 import com.phonect.android.model.*
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.*
 import java.io.*
 import java.net.*
@@ -23,8 +27,12 @@ import java.net.*
  * Foreground Service that listens for incoming TCP connections from the PC.
  *
  * - Runs a [ServerSocket] on [PORT_DEFAULT] in a coroutine.
- * - When a connection arrives, reads a [ChallengeMessage], triggers
- *   biometric auth, signs the nonce, and sends back a [ResponseMessage].
+ * - When a connection arrives, **validates the peer IP** against the trusted
+ *   PCs list.  Unknown IPs are dropped **before** any biometric prompt
+ *   (prevents prompt-bombing).
+ * - Reads a [ChallengeMessage], triggers biometric auth via **CryptoObject**
+ *   (cryptographically bound), signs the nonce, and sends back a
+ *   [ResponseMessage].
  * - Only activated when connected to a trusted Wi-Fi network (optional).
  *
  * The service shows a persistent low-priority notification.
@@ -35,13 +43,42 @@ class PhonectNetworkService : Service() {
         private const val TAG = "PhonectService"
         private const val CHANNEL_ID = "phonect_listener"
         private const val NOTIFICATION_ID = 1
+        private const val PREFS_NAME = "phonect_prefs"
+        private const val PREFS_PAIRED_PCS = "paired_pcs"
         const val PORT_DEFAULT = 9876
 
-        /** Intent actions */
         const val ACTION_START = "com.phonect.android.START"
         const val ACTION_STOP = "com.phonect.android.STOP"
         const val ACTION_BROADCAST_STATUS = "com.phonect.android.STATUS"
         const val EXTRA_STATUS = "status"
+
+        /**
+         * Weak reference to the current Activity, set by [MainActivity]
+         * in ``onCreate`` via [setCurrentActivity].
+         *
+         * The [PhonectNetworkService] reads this when it needs to show a
+         * [BiometricPrompt].  A weak reference prevents memory leaks if the
+         * Activity is destroyed while the service is running.
+         */
+        @JvmStatic
+        private var currentActivityRef: java.lang.ref.WeakReference<android.app.Activity>? = null
+
+        /**
+         * Called by [MainActivity] (or any Activity) to register itself
+         * for BiometricPrompt display.  Must be called in ``onCreate``.
+         */
+        @JvmStatic
+        fun setCurrentActivity(activity: android.app.Activity) {
+            currentActivityRef = java.lang.ref.WeakReference(activity)
+        }
+
+        /**
+         * Returns the currently registered Activity, or ``null``.
+         */
+        @JvmStatic
+        fun getCurrentActivity(): android.app.Activity? {
+            return currentActivityRef?.get()
+        }
     }
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -49,8 +86,8 @@ class PhonectNetworkService : Service() {
     private var listenJob: Job? = null
 
     private lateinit var cryptoManager: CryptoManager
-    private lateinit var biometricHandler: BiometricHandler
-    private var currentActivityRef: java.lang.ref.WeakReference<android.app.Activity>? = null
+    private lateinit var prefs: SharedPreferences
+    private val gson = Gson()
 
     // ------------------------------------------------------------------
     // Lifecycle
@@ -59,12 +96,10 @@ class PhonectNetworkService : Service() {
     override fun onCreate() {
         super.onCreate()
         cryptoManager = CryptoManager(this)
+        prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         createNotificationChannel()
 
-        // Ensure the Keystore key exists (generated once)
         cryptoManager.generateKeyIfNeeded()
-
-        // Monitor Wi-Fi connectivity
         registerWifiCallback()
 
         Log.i(TAG, "Service created")
@@ -75,7 +110,7 @@ class PhonectNetworkService : Service() {
             ACTION_START -> startListening()
             ACTION_STOP -> stopListening()
         }
-        return START_STICKY  // restart if killed
+        return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -88,14 +123,35 @@ class PhonectNetworkService : Service() {
     }
 
     // ------------------------------------------------------------------
-    // Public API (called from Activity)
+    // Trusted PCs management
     // ------------------------------------------------------------------
 
-    /** Set a reference to the current Activity for BiometricPrompt. */
-    fun setCurrentActivity(activity: android.app.Activity) {
-        currentActivityRef = java.lang.ref.WeakReference(activity)
-        if (activity is androidx.fragment.app.FragmentActivity) {
-            biometricHandler = BiometricHandler(activity)
+    /** Returns the list of currently paired PCs from SharedPreferences. */
+    fun getTrustedPcs(): List<PairedPc> {
+        val json = prefs.getString(PREFS_PAIRED_PCS, "[]") ?: "[]"
+        val type = object : TypeToken<List<PairedPc>>() {}.type
+        return gson.fromJson(json, type) ?: emptyList()
+    }
+
+    /** Persist the paired PCs list. */
+    fun setTrustedPcs(pcs: List<PairedPc>) {
+        prefs.edit().putString(PREFS_PAIRED_PCS, gson.toJson(pcs)).apply()
+    }
+
+    /**
+     * Check whether [remoteAddress] belongs to a trusted PC.
+     * If the trusted list is empty, all connections are allowed
+     * (first-pairing mode).
+     */
+    private fun isTrustedPeer(remoteAddress: InetAddress): Boolean {
+        val trusted = getTrustedPcs()
+        if (trusted.isEmpty()) {
+            // No PCs paired yet — allow any (will be paired via QR later)
+            return true
+        }
+        val rawIp = remoteAddress.hostAddress
+        return trusted.any { pc ->
+            pc.ipAddress == rawIp
         }
     }
 
@@ -127,10 +183,17 @@ class PhonectNetworkService : Service() {
                         continue
                     } ?: break
 
-                    Log.i(TAG, "Connection from ${clientSocket.inetAddress.hostAddress}")
-                    updateNotification("Connection from ${clientSocket.inetAddress.hostAddress}")
+                    val peerIp = clientSocket.inetAddress.hostAddress
+                    Log.i(TAG, "Connection from $peerIp")
+                    updateNotification("Connection from $peerIp")
 
-                    // Handle each connection in a new coroutine
+                    // ── Security: validate peer IP before any prompt ──────
+                    if (!isTrustedPeer(clientSocket.inetAddress)) {
+                        Log.w(TAG, "Rejected untrusted peer: $peerIp")
+                        try { clientSocket.close() } catch (_: Exception) {}
+                        continue
+                    }
+
                     launch { handleConnection(clientSocket) }
                 }
 
@@ -158,14 +221,16 @@ class PhonectNetworkService : Service() {
 
     private suspend fun handleConnection(clientSocket: Socket) {
         try {
-            clientSocket.soTimeout = 15_000  // 15s timeout for I/O
+            clientSocket.soTimeout = 15_000
             val input = clientSocket.getInputStream()
             val output = clientSocket.getOutputStream()
+
+            val peerIp = clientSocket.inetAddress.hostAddress ?: "?"
 
             // 1. Read challenge frame
             val challenge = ProtocolHandler.readChallenge(input)
             if (challenge == null) {
-                Log.w(TAG, "Invalid challenge from ${clientSocket.inetAddress}")
+                Log.w(TAG, "Invalid challenge from $peerIp")
                 ProtocolHandler.sendError(output, "", "invalid_challenge")
                 return
             }
@@ -173,23 +238,39 @@ class PhonectNetworkService : Service() {
             val nonceBytes = try {
                 hexStringToByteArray(challenge.nonce)
             } catch (e: IllegalArgumentException) {
-                Log.e(TAG, "Invalid nonce hex")
+                Log.e(TAG, "Invalid nonce hex from $peerIp")
                 ProtocolHandler.sendError(output, challenge.session_id, "invalid_nonce")
                 return
             }
 
             if (nonceBytes.size != 32) {
-                Log.e(TAG, "Nonce length ${nonceBytes.size} != 32")
+                Log.e(TAG, "Nonce length ${nonceBytes.size} != 32 from $peerIp")
                 ProtocolHandler.sendError(output, challenge.session_id, "nonce_length_mismatch")
                 return
             }
 
-            Log.i(TAG, "Challenge received: session=${challenge.session_id}, nonce=${challenge.nonce.take(16)}…")
+            Log.i(TAG, "Challenge received: session=${challenge.session_id}, from=$peerIp")
 
-            // 2. Biometric prompt (on UI thread)
-            val authResult = biometricHandler.awaitAuthentication(
-                title = "Unlock ${clientSocket.inetAddress.hostName}",
+            // 2. Get the current Activity for BiometricPrompt
+            val activity = getCurrentActivity() as? androidx.fragment.app.FragmentActivity
+            if (activity == null) {
+                Log.w(TAG, "No Activity registered — cannot show biometric prompt")
+                ProtocolHandler.sendError(output, challenge.session_id, "no_ui_context")
+                return
+            }
+            val handler = BiometricHandler(activity)
+
+            // 3. Prepare CryptoObject (Signature bound to Keystore)
+            val signature = cryptoManager.getInitializedSignature()
+            val cryptoObject = BiometricPrompt.CryptoObject(signature)
+
+            // 4. Biometric prompt (on UI thread) with CryptoObject
+            //    Use hostAddress (raw IP) in title — no hostName to prevent
+            //    reverse-DNS spoofing (CVE-style mDNS manipulation).
+            val authResult = handler.awaitAuthentication(
+                title = "Unlock $peerIp",
                 subtitle = "Scan fingerprint to unlock your PC",
+                cryptoObject = cryptoObject,
             )
 
             if (authResult == null) {
@@ -198,28 +279,35 @@ class PhonectNetworkService : Service() {
                 return
             }
 
-            // 3. Sign the nonce (inside biometric auth context)
-            val signature = cryptoManager.sign(data = nonceBytes)
-            Log.i(TAG, "Nonce signed: ${signature.size} bytes")
+            // 4. Extract the *validated* Signature from the auth result.
+            //    Because the key requires biometric auth (userAuthenticationValidity=-1),
+            //    the system guarantees this Signature was just unlocked.
+            val validatedSignature = authResult.cryptoObject?.signature
+                ?: throw SecurityException("CryptoObject missing from biometric result")
 
-            // 4. Build and send response
+            // 5. Sign the nonce (update + sign)
+            validatedSignature.update(nonceBytes)
+            val signedBytes = validatedSignature.sign()
+            Log.i(TAG, "Nonce signed: ${signedBytes.size} bytes")
+
+            // 6. Build and send response
             val fingerprint = cryptoManager.getPublicKeyFingerprint() ?: "unknown"
             val response = ResponseMessage(
                 session_id = challenge.session_id,
-                signature = signature.toHex(),
+                signature = signedBytes.toHex(),
                 public_key_fingerprint = fingerprint,
                 device_name = Build.MODEL,
             )
 
             ProtocolHandler.sendResponse(output, response)
-            Log.i(TAG, "Response sent to ${clientSocket.inetAddress}")
+            Log.i(TAG, "Response sent to $peerIp")
 
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Security constraint violated: ${e.message}")
         } catch (e: java.net.SocketTimeoutException) {
             Log.e(TAG, "Socket timeout during handshake", e)
         } catch (e: IOException) {
             Log.e(TAG, "I/O error during handshake", e)
-        } catch (e: SecurityException) {
-            Log.e(TAG, "Security constraint violated", e)
         } catch (e: Exception) {
             Log.e(TAG, "Unexpected error during handshake", e)
         } finally {
@@ -268,7 +356,7 @@ class PhonectNetworkService : Service() {
         val channel = NotificationChannel(
             CHANNEL_ID,
             getString(com.phonect.android.R.string.channel_name),
-            NotificationManager.IMPORTANCE_LOW,  // no sound / heads-up
+            NotificationManager.IMPORTANCE_LOW,
         ).apply {
             description = getString(com.phonect.android.R.string.channel_description)
         }
@@ -280,7 +368,7 @@ class PhonectNetworkService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("phonect")
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_menu_view)  // placeholder
+            .setSmallIcon(android.R.drawable.ic_menu_view)
             .setOngoing(showOngoing)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
@@ -293,7 +381,7 @@ class PhonectNetworkService : Service() {
     }
 
     // ------------------------------------------------------------------
-    // Status broadcast (to Activity)
+    // Status broadcast
     // ------------------------------------------------------------------
 
     private fun broadcastStatus(status: String) {

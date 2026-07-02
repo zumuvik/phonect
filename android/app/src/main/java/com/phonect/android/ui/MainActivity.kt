@@ -51,6 +51,12 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        // ── Critical: register this Activity for BiometricPrompt ─────────
+        // Without this, PhonectNetworkService.handleConnection will not find
+        // a FragmentActivity to show BiometricPrompt on, and will abort the
+        // handshake with "no_ui_context".
+        PhonectNetworkService.setCurrentActivity(this)
+
         // Initialise managers
         cryptoManager = CryptoManager(applicationContext)
         biometricHandler = BiometricHandler(this)
@@ -76,9 +82,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Update references in the service (for BiometricPrompt)
-        val intent = Intent(this, PhonectNetworkService::class.java)
-        startService(intent)  // ensures service is running if needed
+        // Re-register activity reference in case it was cleared
+        PhonectNetworkService.setCurrentActivity(this)
     }
 
     override fun onDestroy() {

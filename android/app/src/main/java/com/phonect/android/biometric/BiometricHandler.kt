@@ -3,7 +3,6 @@ package com.phonect.android.biometric
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.fragment.app.FragmentActivity
-import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -11,18 +10,21 @@ import java.util.concurrent.Executors
 
 /**
  * Wraps AndroidX [BiometricPrompt] and exposes a suspend function
- * that returns the crypto object when the user authenticates.
+ * that returns the [BiometricPrompt.AuthenticationResult] when the
+ * user authenticates.
  *
- * The [CryptoManager.sign] call happens **inside** the BiometricPrompt
- * success callback, so the Keystore key is unlocked.
+ * The caller should:
+ * 1. Create a [Signature] via [CryptoManager.getInitializedSignature]
+ * 2. Wrap it in [BiometricPrompt.CryptoObject]
+ * 3. Pass it to [awaitAuthentication]
+ * 4. On success, extract the validated [Signature] from
+ *    ``result.cryptoObject.signature`` and call ``update(nonce) + sign()``
  */
 
 class BiometricHandler(private val activity: FragmentActivity) {
 
     /**
      * Check if biometric authentication is available on this device.
-     *
-     * @return [BiometricResult] indicating availability or error.
      */
     fun canAuthenticate(): BiometricResult {
         val manager = BiometricManager.from(activity)
@@ -39,14 +41,18 @@ class BiometricHandler(private val activity: FragmentActivity) {
     }
 
     /**
-     * Show the system BiometricPrompt and wait for the user to authenticate.
+     * Show the system BiometricPrompt with the given [cryptoObject].
      *
-     * On success, [onSuccess] is called **inside** the auth context,
-     * so the Keystore key is available for signing.
+     * The [cryptoObject] should contain a [Signature] initialized via
+     * [CryptoManager.getInitializedSignature].  After successful auth,
+     * the [BiometricPrompt.AuthenticationResult] contains the validated
+     * [Signature] ready for ``update()`` / ``sign()``.
      *
      * @param title Prompt title.
      * @param subtitle Prompt subtitle.
      * @param negativeButtonText "Cancel" text.
+     * @param cryptoObject [BiometricPrompt.CryptoObject] wrapping the Signature,
+     *                     or `null` for non-crypto auth (not recommended).
      * @param onSuccess Called with the [BiometricPrompt.AuthenticationResult] after auth.
      * @param onError Called with error code + message on failure.
      */
@@ -54,6 +60,7 @@ class BiometricHandler(private val activity: FragmentActivity) {
         title: String = "Unlock laptop",
         subtitle: String = "Scan fingerprint to unlock your PC",
         negativeButtonText: String = "Cancel",
+        cryptoObject: BiometricPrompt.CryptoObject? = null,
         onSuccess: (BiometricPrompt.AuthenticationResult) -> Unit,
         onError: (errorCode: Int, errString: String) -> Unit = { _, _ -> },
     ) {
@@ -87,18 +94,28 @@ class BiometricHandler(private val activity: FragmentActivity) {
             .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
             .build()
 
-        prompt.authenticate(promptInfo)
+        if (cryptoObject != null) {
+            prompt.authenticate(promptInfo, cryptoObject)
+        } else {
+            prompt.authenticate(promptInfo)
+        }
     }
 
     /**
-     * Show biometric prompt and return a [CompletableDeferred] that resolves
-     * when the user authenticates or cancels.
+     * Show biometric prompt with [cryptoObject] and return a
+     * [CompletableDeferred] that resolves with the
+     * [BiometricPrompt.AuthenticationResult] when the user authenticates
+     * or cancels.
      *
-     * Returns the [BiometricPrompt.AuthenticationResult] on success, null on cancel/error.
+     * Returns the [BiometricPrompt.AuthenticationResult] on success,
+     * ``null`` on cancel/error.
+     *
+     * @param cryptoObject [BiometricPrompt.CryptoObject] wrapping the Signature.
      */
     suspend fun awaitAuthentication(
         title: String = "Unlock laptop",
         subtitle: String = "Scan fingerprint to unlock your PC",
+        cryptoObject: BiometricPrompt.CryptoObject,
     ): BiometricPrompt.AuthenticationResult? {
         val deferred = CompletableDeferred<BiometricPrompt.AuthenticationResult?>()
 
@@ -106,6 +123,7 @@ class BiometricHandler(private val activity: FragmentActivity) {
             promptAuthentication(
                 title = title,
                 subtitle = subtitle,
+                cryptoObject = cryptoObject,
                 onSuccess = { result -> deferred.complete(result) },
                 onError = { _, _ -> deferred.complete(null) },
             )

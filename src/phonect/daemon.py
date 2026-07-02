@@ -26,12 +26,14 @@ from phonect.crypto import (
     rsa,
 )
 from phonect.protocol import (
+    MAX_FRAME_SIZE,
     encode_frame,
     decode_frame,
     make_challenge,
     make_response,
     validate_response,
     ProtocolError,
+    ProtocolSecurityError,
 )
 
 LOG = logging.getLogger("phonect.daemon")
@@ -310,6 +312,10 @@ class PhonectDaemon:
         except (asyncio.TimeoutError, ConnectionError) as exc:
             LOG.warning("Failed to read response: %s", exc)
             return False
+        except ProtocolSecurityError as exc:
+            LOG.error("Security violation in response frame: %s", exc)
+            writer.close()
+            return False
 
         if msg is None:
             LOG.warning("Empty response / connection closed")
@@ -348,18 +354,33 @@ class PhonectDaemon:
         reader: asyncio.StreamReader,
         timeout: float = 10.0,
     ) -> Optional[dict]:
-        """Read one length-prefixed JSON frame from the stream."""
+        """
+        Read one length-prefixed JSON frame from the stream.
+
+        Security
+        --------
+        * Rejects frames whose declared payload exceeds ``MAX_FRAME_SIZE`` (64 KB)
+          to prevent memory exhaustion (DoS/OOM).  The caller must close the
+          connection after catching ``ProtocolSecurityError``.
+        """
+        import struct
+        import json
+
         # Read 4-byte header
         header = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
-        import struct
         payload_len = struct.unpack("!I", header)[0]
+
+        # ── Security: enforce max frame size before allocating ──────────
+        if payload_len <= 0 or payload_len > MAX_FRAME_SIZE:
+            raise ProtocolSecurityError(
+                f"Declared payload length {payload_len} exceeds maximum {MAX_FRAME_SIZE}"
+            )
 
         # Read payload
         payload = await asyncio.wait_for(
             reader.readexactly(payload_len), timeout=timeout,
         )
 
-        import json
         return json.loads(payload.decode("utf-8"))
 
     # ------------------------------------------------------------------
