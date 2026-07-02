@@ -133,6 +133,7 @@ class MainActivity : AppCompatActivity() {
             }
             status == "stopped" -> getString(R.string.status_stopped)
             status == "starting" -> "Starting…"
+            status == "error" -> "Error — check logs"
             status == "wifi_connected" -> "Wi-Fi connected"
             status == "wifi_disconnected" -> "Wi-Fi disconnected"
             else -> status

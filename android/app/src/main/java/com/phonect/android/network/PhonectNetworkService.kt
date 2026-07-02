@@ -99,15 +99,27 @@ class PhonectNetworkService : Service() {
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         createNotificationChannel()
 
-        cryptoManager.generateKeyIfNeeded()
-        registerWifiCallback()
+        // Generate RSA-4096 key in background — takes several seconds on
+        // the first run, must not block the main thread (would cause ANR).
+        serviceScope.launch {
+            cryptoManager.generateKeyIfNeeded()
+            Log.i(TAG, "Key generation completed")
+        }
 
+        registerWifiCallback()
         Log.i(TAG, "Service created")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> startListening()
+            ACTION_START -> {
+                // Show notification immediately — Android requires
+                // startForeground() within a few seconds after
+                // startForegroundService() or it ANRs.
+                val notification = buildNotification("Starting…", false)
+                startForeground(NOTIFICATION_ID, notification)
+                startListening()
+            }
             ACTION_STOP -> stopListening()
         }
         return START_STICKY
@@ -172,9 +184,6 @@ class PhonectNetworkService : Service() {
     private fun startListening() {
         if (listenJob?.isActive == true) return
 
-        val notification = buildNotification("Starting…", false)
-        startForeground(NOTIFICATION_ID, notification)
-
         listenJob = serviceScope.launch {
             try {
                 serverSocket = ServerSocket(PORT_DEFAULT)
@@ -209,6 +218,8 @@ class PhonectNetworkService : Service() {
 
             } catch (e: Exception) {
                 Log.e(TAG, "Listener error", e)
+                updateNotification("Error: ${e.message ?: "unknown"}")
+                broadcastStatus("error")
             } finally {
                 Log.i(TAG, "Listener stopped")
                 updateNotification("Service stopped")
