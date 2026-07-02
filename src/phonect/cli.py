@@ -126,6 +126,12 @@ def cmd_init_config(args: argparse.Namespace) -> None:
     print(f"    phonect daemon")
 
 
+def cmd_tui(_args: argparse.Namespace) -> None:
+    """Launch the Textual TUI."""
+    from phonect.tui import run_tui
+    run_tui()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="phonect",
@@ -166,6 +172,10 @@ def main() -> None:
     ic = sub.add_parser("init-config", help="Write a default config.toml template")
     ic.add_argument("--path", help="Output path (default: ~/.config/phonect/config.toml)")
     ic.set_defaults(func=cmd_init_config)
+
+    # tui
+    tui_p = sub.add_parser("tui", help="Launch the Textual TUI (pairing, status, logs)")
+    tui_p.set_defaults(func=cmd_tui)
 
     args = parser.parse_args()
     args.func(args)
