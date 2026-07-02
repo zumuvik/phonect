@@ -139,20 +139,30 @@ class PhonectNetworkService : Service() {
     }
 
     /**
-     * Check whether [remoteAddress] belongs to a trusted PC.
-     * If the trusted list is empty, all connections are allowed
-     * (first-pairing mode).
+     * Find a trusted PC by IP address.
+     *
+     * Returns the matching [PairedPc] record, or `null` if no PCs are paired
+     * (first-time mode) or the IP does not match.
+     *
+     * In first-time mode (empty list) **all** connections are allowed so the
+     * phone can be paired via QR.  Once at least one PC is paired, only
+     * matching IPs are accepted (prevents prompt-bombing from strangers).
      */
-    private fun isTrustedPeer(remoteAddress: InetAddress): Boolean {
+    private fun findTrustedPeer(remoteAddress: InetAddress): PairedPc? {
         val trusted = getTrustedPcs()
         if (trusted.isEmpty()) {
-            // No PCs paired yet — allow any (will be paired via QR later)
-            return true
+            // First pairing mode — allow any connection
+            return null
         }
         val rawIp = remoteAddress.hostAddress
-        return trusted.any { pc ->
-            pc.ipAddress == rawIp
-        }
+        return trusted.firstOrNull { pc -> pc.ipAddress == rawIp }
+    }
+
+    /**
+     * Check whether [remoteAddress] belongs to a trusted PC.
+     */
+    private fun isTrustedPeer(remoteAddress: InetAddress): Boolean {
+        return findTrustedPeer(remoteAddress) != null || getTrustedPcs().isEmpty()
     }
 
     // ------------------------------------------------------------------
@@ -250,6 +260,31 @@ class PhonectNetworkService : Service() {
             }
 
             Log.i(TAG, "Challenge received: session=${challenge.session_id}, from=$peerIp")
+
+            // ── Mutual auth: verify PC signature (if present) ─────────────
+            if (challenge.pc_signature != null && challenge.pc_key_fingerprint != null) {
+                val trustedPc = findTrustedPeer(clientSocket.inetAddress)
+                if (trustedPc == null && getTrustedPcs().isNotEmpty()) {
+                    Log.w(TAG, "Mutual-auth: no trusted PC record for $peerIp")
+                    ProtocolHandler.sendError(output, challenge.session_id, "untrusted_peer")
+                    return
+                }
+                // If no PCs are paired yet (first-time mode), skip PC verification.
+                // The PC will not have sent mutual auth fields unless already paired.
+                if (trustedPc != null) {
+                    val pcValid = cryptoManager.verifyPcSignature(
+                        nonce = nonceBytes,
+                        signature = challenge.pc_signature,
+                        pcPublicKeyPem = trustedPc.publicKeyPem,
+                    )
+                    if (!pcValid) {
+                        Log.w(TAG, "Mutual-auth FAILED — PC signature invalid for $peerIp")
+                        ProtocolHandler.sendError(output, challenge.session_id, "pc_auth_failed")
+                        return
+                    }
+                    Log.i(TAG, "Mutual-auth OK — PC signature verified (${trustedPc.name})")
+                }
+            }
 
             // 2. Get the current Activity for BiometricPrompt
             val activity = getCurrentActivity() as? androidx.fragment.app.FragmentActivity

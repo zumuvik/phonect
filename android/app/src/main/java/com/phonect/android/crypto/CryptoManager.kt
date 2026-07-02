@@ -195,4 +195,57 @@ class CryptoManager(private val appContext: android.content.Context) {
         }
         return hex.toString()
     }
+
+    // ======================================================================
+    // Mutual auth: verify PC signature
+    // ======================================================================
+
+    /**
+     * Verify an RSA-PSS signature over [nonce] that was made by the PC's
+     * private key.  The PC's public key is obtained from [pcPublicKeyPem].
+     *
+     * @param nonce the challenge nonce (raw 32 bytes).
+     * @param signature hex-encoded RSA-4096 PSS/SHA-512 signature.
+     * @param pcPublicKeyPem PEM-encoded PC public key (X.509 SubjectPublicKeyInfo).
+     * @return true if the signature is valid.
+     */
+    fun verifyPcSignature(
+        nonce: ByteArray,
+        signature: String,
+        pcPublicKeyPem: String,
+    ): Boolean {
+        return try {
+            val sigBytes = hexToByteArray(signature)
+            val pubKey = parsePemPublicKey(pcPublicKeyPem)
+
+            val verifier = Signature.getInstance(SIGNATURE_ALGORITHM)
+            verifier.initVerify(pubKey)
+            verifier.update(nonce)
+            verifier.verify(sigBytes)
+        } catch (e: Exception) {
+            Log.e("CryptoManager", "PC signature verification failed", e)
+            false
+        }
+    }
+
+    /**
+     * Parse a PEM-encoded X.509 SubjectPublicKeyInfo into a [PublicKey].
+     */
+    private fun parsePemPublicKey(pem: String): PublicKey {
+        val cleaned = pem
+            .replace("-----BEGIN PUBLIC KEY-----", "")
+            .replace("-----END PUBLIC KEY-----", "")
+            .replace("\\s".toRegex(), "")
+        val der = Base64.getDecoder().decode(cleaned)
+        val keyFactory = KeyFactory.getInstance("RSA")
+        return keyFactory.generatePublic(X509EncodedKeySpec(der))
+    }
+
+    /** Convert hex string to ByteArray. */
+    private fun hexToByteArray(hex: String): ByteArray {
+        val cleaned = hex.replace(" ", "").lowercase()
+        return ByteArray(cleaned.length / 2) {
+            ((cleaned[it * 2].digitToInt(16) shl 4) + cleaned[it * 2 + 1].digitToInt(16)).toByte()
+        }
+    }
 }

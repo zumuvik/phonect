@@ -21,7 +21,9 @@ from phonect.config import DaemonConfig, load_config
 from phonect.crypto import (
     generate_nonce,
     load_public_key,
+    load_private_key,
     verify_nonce,
+    sign_nonce,
     fingerprint_from_public_key,
     rsa,
 )
@@ -80,7 +82,7 @@ class PhonectDaemon:
         # Override hook for tests (capture unlock commands)
         self._unlock_hook: Optional[Callable[[List[str]], None]] = None
 
-        # Load the trusted public key
+        # Load the trusted (mobile) public key
         self._trusted_key: Optional[rsa.RSAPublicKey] = None
         if config.valid:
             try:
@@ -90,10 +92,22 @@ class PhonectDaemon:
         else:
             LOG.warning("Daemon config is incomplete — auth will not be possible")
 
+        # Load the PC private key for mutual authentication
+        self._pc_private_key: Optional[rsa.RSAPrivateKey] = None
+        if config.private_key_path.exists():
+            try:
+                self._pc_private_key = load_private_key(config.pc_private_key_pem)
+                LOG.info("PC private key loaded for mutual auth")
+            except Exception as exc:
+                LOG.error("Failed to load PC private key: %s", exc)
+        else:
+            LOG.info("No PC private key — mutual auth disabled (pair via TUI first)")
+
         LOG.info(
-            "PhonectDaemon initialised (mobile=%s:%d, poll=%.1fs/%.1fs)",
+            "PhonectDaemon initialised (mobile=%s:%d, poll=%.1fs/%.1fs, mutual=%s)",
             config.mobile_ip, config.mobile_port,
             config.poll_interval, config.poll_timeout,
+            self._pc_private_key is not None,
         )
 
     # ------------------------------------------------------------------
@@ -298,9 +312,23 @@ class PhonectDaemon:
             LOG.error("No trusted public key loaded — cannot verify")
             return False
 
-        # 1. Send challenge
+        # 1. Send challenge (with mutual-auth fields if PC private key loaded)
         nonce = generate_nonce()
-        challenge = make_challenge(nonce)
+
+        pc_fp: Optional[str] = None
+        pc_sig: Optional[bytes] = None
+        if self._pc_private_key is not None:
+            pc_fp = fingerprint_from_public_key(
+                self._pc_private_key.public_key()
+            )
+            pc_sig = sign_nonce(self._pc_private_key, nonce)
+            LOG.debug("Mutual-auth: challenge signed by PC key %s", pc_fp[:16])
+
+        challenge = make_challenge(
+            nonce,
+            pc_key_fingerprint=pc_fp,
+            pc_signature=pc_sig,
+        )
         writer.write(encode_frame(challenge))
         await writer.drain()
 

@@ -12,6 +12,10 @@ dependencies = [
 phonect = "phonect.cli:main"
 
 [project.optional-dependencies]
+tui = [
+    "textual>=0.52.0",
+    "qrcode>=7.4",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
