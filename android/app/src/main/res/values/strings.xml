@@ -11,5 +11,7 @@
     <string name="status_stopped">Service stopped</string>
     <string name="label_paired_pcs">Paired PCs</string>
     <string name="label_logs">Logs</string>
-    <string name="btn_share_logs">Share Logs</string>
+    <string name="btn_copy_logs">Copy Logs</string>
+    <string name="btn_clear_logs">Clear Logs</string>
+    <string name="toast_logs_copied">Logs copied to clipboard!</string>
 </resources>

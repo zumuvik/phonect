@@ -106,10 +106,28 @@
 
     </ScrollView>
 
-    <Button
-        android:id="@+id/btn_share_logs"
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="@string/btn_share_logs" />
+        android:orientation="horizontal"
+        android:weightSum="2">
+
+        <Button
+            android:id="@+id/btn_copy_logs"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginEnd="6dp"
+            android:text="@string/btn_copy_logs" />
+
+        <Button
+            android:id="@+id/btn_clear_logs"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="6dp"
+            android:text="@string/btn_clear_logs" />
+
+    </LinearLayout>
 
 </LinearLayout>

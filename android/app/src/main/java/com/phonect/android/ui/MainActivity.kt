@@ -1,6 +1,8 @@
 package com.phonect.android.ui
 
 import android.content.BroadcastReceiver
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -36,7 +38,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var logView: TextView
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
-    private lateinit var shareButton: Button
+    private lateinit var copyButton: Button
+    private lateinit var clearButton: Button
 
     private var serviceRunning = false
 
@@ -80,11 +83,13 @@ class MainActivity : AppCompatActivity() {
         logView = findViewById(R.id.log_view)
         startButton = findViewById(R.id.btn_start_service)
         stopButton = findViewById(R.id.btn_stop_service)
-        shareButton = findViewById(R.id.btn_share_logs)
+        copyButton = findViewById(R.id.btn_copy_logs)
+        clearButton = findViewById(R.id.btn_clear_logs)
 
         startButton.setOnClickListener { startService() }
         stopButton.setOnClickListener { stopService() }
-        shareButton.setOnClickListener { shareLogs() }
+        copyButton.setOnClickListener { copyLogs() }
+        clearButton.setOnClickListener { clearLogs() }
 
         // Register status receiver
         LocalBroadcastManager.getInstance(this)
@@ -213,14 +218,21 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Share the log file via Android's share sheet (Intent.ACTION_SEND).
+     * Copy the full log content to the system clipboard.
      */
-    private fun shareLogs() {
-        val intent = LogManager.createShareIntent()
-        if (intent != null) {
-            startActivity(Intent.createChooser(intent, "Share phonect logs"))
-        } else {
-            Toast.makeText(this, "LogManager not initialised", Toast.LENGTH_SHORT).show()
-        }
+    private fun copyLogs() {
+        val content = LogManager.getLogContent()
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val clip = ClipData.newPlainText("phonect logs", content)
+        clipboard.setPrimaryClip(clip)
+        Toast.makeText(this, R.string.toast_logs_copied, Toast.LENGTH_SHORT).show()
+    }
+
+    /**
+     * Clear the log file on disk and reset the on-screen log view.
+     */
+    private fun clearLogs() {
+        LogManager.clearLogs()
+        logView.text = ""
     }
 }

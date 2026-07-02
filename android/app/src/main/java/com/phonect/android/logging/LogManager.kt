@@ -133,29 +133,15 @@ object LogManager {
     }
 
     /**
-     * Create an [Intent.ACTION_SEND] intent with a [FileProvider] URI for
-     * sharing the log file.  Returns `null` if LogManager is not initialised.
+     * Clear all log entries: truncate the file on disk.
      */
-    fun createShareIntent(): Intent? {
-        val ctx = appContext ?: return null
-        val file = logFile ?: return null
-
-        // Ensure the file exists (write a header if empty)
-        if (!file.exists() || file.length() == 0L) {
-            val header = "[${dateFormat.format(Date())}] [INFO] [LogManager] phonect logs\n"
-            file.writeText(header)
-        }
-
-        val uri = androidx.core.content.FileProvider.getUriForFile(
-            ctx,
-            "${ctx.packageName}.fileprovider",
-            file,
-        )
-
-        return Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_STREAM, uri)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    fun clearLogs() {
+        lock.withLock {
+            try {
+                logFile?.writeText("")
+            } catch (e: Exception) {
+                android.util.Log.e("LogManager", "Failed to clear logs", e)
+            }
         }
     }
 }
