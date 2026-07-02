@@ -22,20 +22,18 @@ import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.*
 import java.io.*
 import java.net.*
+import java.nio.ByteBuffer
 
 /**
- * Foreground Service that listens for incoming TCP connections from the PC.
+ * Foreground Service that listens for UDP discovery broadcasts from the PC.
  *
- * - Runs a [ServerSocket] on [PORT_DEFAULT] in a coroutine.
- * - When a connection arrives, **validates the peer IP** against the trusted
- *   PCs list.  Unknown IPs are dropped **before** any biometric prompt
- *   (prevents prompt-bombing).
- * - Reads a [ChallengeMessage], triggers biometric auth via **CryptoObject**
- *   (cryptographically bound), signs the nonce, and sends back a
- *   [ResponseMessage].
- * - Only activated when connected to a trusted Wi-Fi network (optional).
- *
- * The service shows a persistent low-priority notification.
+ * - Listens on UDP port [UDP_DISCOVERY_PORT] (9875) for `PHONECT_DISCOVERY:` packets.
+ * - On discovery, connects to the PC via TCP (port [PC_LISTEN_PORT]) and performs:
+ *   1. **TOFU (Trust On First Use)**: sends `pair_hello` with the phone's public key,
+ *      receives `pair_accept` with the PC's public key, saves PC in trusted list.
+ *   2. **Challenge-response**: receives challenge, triggers biometric auth via
+ *      **CryptoObject**, signs the nonce, sends response.
+ * - Shows a persistent low-priority notification.
  */
 class PhonectNetworkService : Service() {
 
@@ -45,36 +43,20 @@ class PhonectNetworkService : Service() {
         private const val NOTIFICATION_ID = 1
         private const val PREFS_NAME = "phonect_prefs"
         private const val PREFS_PAIRED_PCS = "paired_pcs"
-        const val PORT_DEFAULT = 9876
 
         const val ACTION_START = "com.phonect.android.START"
         const val ACTION_STOP = "com.phonect.android.STOP"
         const val ACTION_BROADCAST_STATUS = "com.phonect.android.STATUS"
         const val EXTRA_STATUS = "status"
 
-        /**
-         * Weak reference to the current Activity, set by [MainActivity]
-         * in ``onCreate`` via [setCurrentActivity].
-         *
-         * The [PhonectNetworkService] reads this when it needs to show a
-         * [BiometricPrompt].  A weak reference prevents memory leaks if the
-         * Activity is destroyed while the service is running.
-         */
         @JvmStatic
         private var currentActivityRef: java.lang.ref.WeakReference<android.app.Activity>? = null
 
-        /**
-         * Called by [MainActivity] (or any Activity) to register itself
-         * for BiometricPrompt display.  Must be called in ``onCreate``.
-         */
         @JvmStatic
         fun setCurrentActivity(activity: android.app.Activity) {
             currentActivityRef = java.lang.ref.WeakReference(activity)
         }
 
-        /**
-         * Returns the currently registered Activity, or ``null``.
-         */
         @JvmStatic
         fun getCurrentActivity(): android.app.Activity? {
             return currentActivityRef?.get()
@@ -82,8 +64,8 @@ class PhonectNetworkService : Service() {
     }
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var serverSocket: ServerSocket? = null
     private var listenJob: Job? = null
+    private var udpSocket: DatagramSocket? = null
 
     private lateinit var cryptoManager: CryptoManager
     private lateinit var prefs: SharedPreferences
@@ -100,8 +82,6 @@ class PhonectNetworkService : Service() {
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         createNotificationChannel()
 
-        // Generate RSA-4096 key in background — takes several seconds on
-        // the first run, must not block the main thread (would cause ANR).
         serviceScope.launch {
             cryptoManager.generateKeyIfNeeded()
             LogManager.i(TAG, "Key generation completed")
@@ -114,14 +94,11 @@ class PhonectNetworkService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
-                // Show notification immediately — Android requires
-                // startForeground() within a few seconds after
-                // startForegroundService() or it ANRs.
-                val notification = buildNotification("Starting…", false)
+                val notification = buildNotification("Listening for PCs…", false)
                 startForeground(NOTIFICATION_ID, notification)
-                startListening()
+                startDiscovery()
             }
-            ACTION_STOP -> stopListening()
+            ACTION_STOP -> stopDiscovery()
         }
         return START_STICKY
     }
@@ -129,7 +106,7 @@ class PhonectNetworkService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        stopListening()
+        stopDiscovery()
         serviceScope.cancel()
         unregisterWifiCallback()
         super.onDestroy()
@@ -149,217 +126,255 @@ class PhonectNetworkService : Service() {
     /** Persist the paired PCs list. */
     fun setTrustedPcs(pcs: List<PairedPc>) {
         prefs.edit().putString(PREFS_PAIRED_PCS, gson.toJson(pcs)).apply()
+        LogManager.i(TAG, "Trusted PCs updated: ${pcs.size} device(s)")
     }
 
     /**
      * Find a trusted PC by IP address.
      *
-     * Returns the matching [PairedPc] record, or `null` if no PCs are paired
-     * (first-time mode) or the IP does not match.
-     *
-     * In first-time mode (empty list) **all** connections are allowed so the
-     * phone can be paired via QR.  Once at least one PC is paired, only
-     * matching IPs are accepted (prevents prompt-bombing from strangers).
+     * Returns the matching [PairedPc] record, or `null` if the IP is unknown.
+     * When no PCs are paired at all (first-time), returns null — caller
+     * should proceed with TOFU.
      */
     private fun findTrustedPeer(remoteAddress: InetAddress): PairedPc? {
         val trusted = getTrustedPcs()
-        if (trusted.isEmpty()) {
-            // First pairing mode — allow any connection
-            return null
-        }
+        if (trusted.isEmpty()) return null
         val rawIp = remoteAddress.hostAddress
         return trusted.firstOrNull { pc -> pc.ipAddress == rawIp }
     }
 
-    /**
-     * Check whether [remoteAddress] belongs to a trusted PC.
-     */
-    private fun isTrustedPeer(remoteAddress: InetAddress): Boolean {
-        return findTrustedPeer(remoteAddress) != null || getTrustedPcs().isEmpty()
-    }
-
     // ------------------------------------------------------------------
-    // TCP listener
+    // UDP discovery listener
     // ------------------------------------------------------------------
 
-    private fun startListening() {
+    private fun startDiscovery() {
         if (listenJob?.isActive == true) return
 
         listenJob = serviceScope.launch {
             try {
-                serverSocket = ServerSocket(PORT_DEFAULT)
-                serverSocket?.reuseAddress = true
-                val port = serverSocket?.localPort ?: PORT_DEFAULT
-                LogManager.i(TAG, "Listening on port $port")
-                updateNotification("Listening on port $port")
-                broadcastStatus("listening:$port")
+                udpSocket = DatagramSocket(UDP_DISCOVERY_PORT).apply {
+                    reuseAddress = true
+                    broadcast = true
+                    soTimeout = 5000  // 5s timeout for cancellation
+                }
+                LogManager.i(TAG, "UDP discovery listening on port $UDP_DISCOVERY_PORT")
+                updateNotification("Listening for PCs (UDP :$UDP_DISCOVERY_PORT)")
+                broadcastStatus("listening:udp:$UDP_DISCOVERY_PORT")
+
+                val buffer = ByteArray(512)
+                val packet = DatagramPacket(buffer, buffer.size)
 
                 while (isActive) {
-                    val clientSocket = try {
-                        serverSocket?.accept()
-                    } catch (e: SocketException) {
-                        if (!isActive) break
-                        LogManager.e(TAG, "Accept failed", e)
-                        continue
-                    } ?: break
-
-                    val peerIp = clientSocket.inetAddress.hostAddress
-                    LogManager.i(TAG, "Connection from $peerIp")
-                    updateNotification("Connection from $peerIp")
-
-                    // ── Security: validate peer IP before any prompt ──────
-                    if (!isTrustedPeer(clientSocket.inetAddress)) {
-                        LogManager.w(TAG, "Rejected untrusted peer: $peerIp")
-                        try { clientSocket.close() } catch (_: Exception) {}
-                        continue
+                    try {
+                        udpSocket?.receive(packet) ?: break
+                    } catch (e: SocketTimeoutException) {
+                        continue  // timeout is normal — re-loop for cancellation check
                     }
 
-                    launch { handleConnection(clientSocket) }
-                }
+                    val data = String(
+                        packet.data, packet.offset, packet.length, Charsets.UTF_8
+                    )
+                    val pcIp = packet.address.hostAddress ?: continue
 
+                    if (data.startsWith(DISCOVERY_PREFIX)) {
+                        val parts = data.removePrefix(DISCOVERY_PREFIX).split(":")
+                        val pcName = parts.getOrElse(0) { "PC" }
+                        LogManager.i(TAG, "Discovery from $pcIp: $pcName")
+
+                        // Connect to PC in a new coroutine (don't block UDP listener)
+                        launch {
+                            connectToPc(pcIp, PC_LISTEN_PORT, pcName)
+                        }
+                    }
+                }
             } catch (e: Exception) {
-                LogManager.e(TAG, "Listener error", e)
+                LogManager.e(TAG, "UDP discovery error", e)
                 updateNotification("Error: ${e.message ?: "unknown"}")
                 broadcastStatus("error")
             } finally {
-                LogManager.i(TAG, "Listener stopped")
+                try { udpSocket?.close() } catch (_: Exception) {}
+                LogManager.i(TAG, "UDP discovery stopped")
                 updateNotification("Service stopped")
                 broadcastStatus("stopped")
             }
         }
     }
 
-    private fun stopListening() {
+    private fun stopDiscovery() {
         listenJob?.cancel()
-        try { serverSocket?.close() } catch (_: Exception) {}
-        serverSocket = null
+        try { udpSocket?.close() } catch (_: Exception) {}
+        udpSocket = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
     // ------------------------------------------------------------------
-    // Connection handler
+    // TCP connection to PC
     // ------------------------------------------------------------------
 
-    private suspend fun handleConnection(clientSocket: Socket) {
+    private suspend fun connectToPc(pcIp: String, port: Int, pcName: String) {
+        var socket: Socket? = null
         try {
-            clientSocket.soTimeout = 15_000
-            val input = clientSocket.getInputStream()
-            val output = clientSocket.getOutputStream()
+            LogManager.i(TAG, "Connecting to $pcIp:$port ...")
 
-            val peerIp = clientSocket.inetAddress.hostAddress ?: "?"
+            socket = Socket()
+            socket.connect(InetSocketAddress(pcIp, port), 10_000)
 
-            // 1. Read challenge frame
-            val challenge = ProtocolHandler.readChallenge(input)
-            if (challenge == null) {
-                LogManager.w(TAG, "Invalid challenge from $peerIp")
-                ProtocolHandler.sendError(output, "", "invalid_challenge")
+            val input = socket.getInputStream()
+            val output = socket.getOutputStream()
+
+            // ── Step 1: TOFU — send pair_hello ──────────────────────
+            val pubKeyPem = cryptoManager.getPublicKeyPem()
+            val pubKeyFp = cryptoManager.getPublicKeyFingerprint()
+            if (pubKeyPem == null || pubKeyFp == null) {
+                LogManager.e(TAG, "Phone key not ready — skipping handshake")
                 return
             }
+
+            val hello = PairHelloMessage(
+                public_key_pem = pubKeyPem,
+                public_key_fingerprint = pubKeyFp,
+                device_name = Build.MODEL,
+            )
+            ProtocolHandler.sendPairHello(output, hello)
+            LogManager.i(TAG, "PairHello sent to $pcIp")
+
+            // ── Step 2: Receive pair_accept ─────────────────────────
+            val accept = ProtocolHandler.readPairAccept(input)
+            if (accept == null) {
+                LogManager.w(TAG, "No PairAccept from $pcIp — aborting")
+                return
+            }
+            LogManager.i(TAG, "PairAccept received from $pcIp")
+
+            // Save PC in trusted list
+            saveTrustedPc(
+                name = pcName,
+                ipAddress = pcIp,
+                port = port,
+                publicKeyPem = accept.public_key_pem,
+                publicKeyFingerprint = accept.public_key_fingerprint,
+            )
+
+            // ── Step 3: Read challenge ──────────────────────────────
+            val challenge = ProtocolHandler.readChallenge(input)
+            if (challenge == null) {
+                LogManager.w(TAG, "No challenge from $pcIp")
+                return
+            }
+            LogManager.i(TAG, "Challenge received: session=${challenge.session_id}")
 
             val nonceBytes = try {
                 hexStringToByteArray(challenge.nonce)
             } catch (e: IllegalArgumentException) {
-                LogManager.e(TAG, "Invalid nonce hex from $peerIp")
-                ProtocolHandler.sendError(output, challenge.session_id, "invalid_nonce")
+                LogManager.e(TAG, "Invalid nonce hex from $pcIp")
                 return
             }
-
             if (nonceBytes.size != 32) {
-                LogManager.e(TAG, "Nonce length ${nonceBytes.size} != 32 from $peerIp")
-                ProtocolHandler.sendError(output, challenge.session_id, "nonce_length_mismatch")
+                LogManager.e(TAG, "Nonce length ${nonceBytes.size} != 32")
                 return
             }
 
-            LogManager.i(TAG, "Challenge received: session=${challenge.session_id}, from=$peerIp")
-
-            // ── Mutual auth: verify PC signature (if present) ─────────────
-            if (challenge.pc_signature != null && challenge.pc_key_fingerprint != null) {
-                val trustedPc = findTrustedPeer(clientSocket.inetAddress)
-                if (trustedPc == null && getTrustedPcs().isNotEmpty()) {
-                    LogManager.w(TAG, "Mutual-auth: no trusted PC record for $peerIp")
-                    ProtocolHandler.sendError(output, challenge.session_id, "untrusted_peer")
+            // ── Step 4: Verify PC signature (mutual auth) ────────────
+            val trustedPc = findTrustedPeer(InetAddress.getByName(pcIp))
+            if (trustedPc != null &&
+                challenge.pc_signature != null &&
+                challenge.pc_key_fingerprint != null
+            ) {
+                val pcValid = cryptoManager.verifyPcSignature(
+                    nonce = nonceBytes,
+                    signature = challenge.pc_signature,
+                    pcPublicKeyPem = trustedPc.publicKeyPem,
+                )
+                if (!pcValid) {
+                    LogManager.w(TAG, "Mutual auth FAILED — PC signature invalid for $pcIp")
                     return
                 }
-                // If no PCs are paired yet (first-time mode), skip PC verification.
-                // The PC will not have sent mutual auth fields unless already paired.
-                if (trustedPc != null) {
-                    val pcValid = cryptoManager.verifyPcSignature(
-                        nonce = nonceBytes,
-                        signature = challenge.pc_signature,
-                        pcPublicKeyPem = trustedPc.publicKeyPem,
-                    )
-                    if (!pcValid) {
-                        LogManager.w(TAG, "Mutual-auth FAILED — PC signature invalid for $peerIp")
-                        ProtocolHandler.sendError(output, challenge.session_id, "pc_auth_failed")
-                        return
-                    }
-                    LogManager.i(TAG, "Mutual-auth OK — PC signature verified (${trustedPc.name})")
-                }
+                LogManager.i(TAG, "Mutual auth OK — PC verified")
+            } else if (getTrustedPcs().isNotEmpty() && trustedPc == null) {
+                LogManager.w(TAG, "Untrusted PC $pcIp — no matching trusted record")
+                return
             }
 
-            // 2. Get the current Activity for BiometricPrompt
+            // ── Step 5: Biometric prompt ─────────────────────────────
             val activity = getCurrentActivity() as? androidx.fragment.app.FragmentActivity
             if (activity == null) {
-                LogManager.w(TAG, "No Activity registered — cannot show biometric prompt")
-                ProtocolHandler.sendError(output, challenge.session_id, "no_ui_context")
+                LogManager.w(TAG, "No Activity — cannot show biometric prompt")
                 return
             }
             val handler = BiometricHandler(activity)
-
-            // 3. Prepare CryptoObject (Signature bound to Keystore)
             val signature = cryptoManager.getInitializedSignature()
             val cryptoObject = BiometricPrompt.CryptoObject(signature)
-
-            // 4. Biometric prompt (on UI thread) with CryptoObject
-            //    Use hostAddress (raw IP) in title — no hostName to prevent
-            //    reverse-DNS spoofing (CVE-style mDNS manipulation).
             val authResult = handler.awaitAuthentication(
-                title = "Unlock $peerIp",
+                title = "Unlock $pcName",
                 subtitle = "Scan fingerprint to unlock your PC",
                 cryptoObject = cryptoObject,
             )
-
             if (authResult == null) {
                 LogManager.w(TAG, "Biometric declined by user")
-                ProtocolHandler.sendError(output, challenge.session_id, "biometric_declined")
                 return
             }
 
-            // 4. Extract the *validated* Signature from the auth result.
-            //    Because the key requires biometric auth (userAuthenticationValidity=-1),
-            //    the system guarantees this Signature was just unlocked.
+            // ── Step 6: Sign nonce ───────────────────────────────────
             val validatedSignature = authResult.cryptoObject?.signature
                 ?: throw SecurityException("CryptoObject missing from biometric result")
-
-            // 5. Sign the nonce (update + sign)
             validatedSignature.update(nonceBytes)
             val signedBytes = validatedSignature.sign()
             LogManager.i(TAG, "Nonce signed: ${signedBytes.size} bytes")
 
-            // 6. Build and send response
-            val fingerprint = cryptoManager.getPublicKeyFingerprint() ?: "unknown"
+            // ── Step 7: Send response ────────────────────────────────
             val response = ResponseMessage(
                 session_id = challenge.session_id,
                 signature = signedBytes.toHex(),
-                public_key_fingerprint = fingerprint,
+                public_key_fingerprint = pubKeyFp,
                 device_name = Build.MODEL,
             )
-
             ProtocolHandler.sendResponse(output, response)
-            LogManager.i(TAG, "Response sent to $peerIp")
+            LogManager.i(TAG, "Response sent to $pcIp")
 
-        } catch (e: SecurityException) {
-            LogManager.e(TAG, "Security constraint violated: ${e.message}")
         } catch (e: java.net.SocketTimeoutException) {
-            LogManager.e(TAG, "Socket timeout during handshake", e)
+            LogManager.e(TAG, "Socket timeout connecting to $pcIp", e)
         } catch (e: IOException) {
-            LogManager.e(TAG, "I/O error during handshake", e)
+            LogManager.e(TAG, "I/O error with $pcIp", e)
+        } catch (e: SecurityException) {
+            LogManager.e(TAG, "Security constraint: ${e.message}")
         } catch (e: Exception) {
-            LogManager.e(TAG, "Unexpected error during handshake", e)
+            LogManager.e(TAG, "Unexpected error with $pcIp", e)
         } finally {
-            try { clientSocket.close() } catch (_: Exception) {}
+            try { socket?.close() } catch (_: Exception) {}
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Trusted PC persistence
+    // ------------------------------------------------------------------
+
+    private fun saveTrustedPc(
+        name: String,
+        ipAddress: String,
+        port: Int,
+        publicKeyPem: String,
+        publicKeyFingerprint: String,
+    ) {
+        val current = getTrustedPcs().toMutableList()
+
+        // Update existing entry or add new
+        val idx = current.indexOfFirst { it.ipAddress == ipAddress }
+        val pc = PairedPc(
+            name = name,
+            hostname = name,
+            ipAddress = ipAddress,
+            port = port,
+            publicKeyPem = publicKeyPem,
+            publicKeyFingerprint = publicKeyFingerprint,
+        )
+        if (idx >= 0) {
+            current[idx] = pc
+        } else {
+            current.add(pc)
+        }
+        setTrustedPcs(current)
+        LogManager.i(TAG, "PC saved/updated: $name ($ipAddress)")
     }
 
     // ------------------------------------------------------------------
@@ -369,29 +384,28 @@ class PhonectNetworkService : Service() {
     private var wifiCallback: ConnectivityManager.NetworkCallback? = null
 
     private fun registerWifiCallback() {
-        val connManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val request = NetworkRequest.Builder()
-            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .addTransportType(android.net.NetworkCapabilities.TRANSPORT_WIFI)
             .build()
-
         wifiCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                LogManager.i(TAG, "Wi-Fi connected — listener ready")
+                LogManager.i(TAG, "Wi-Fi connected")
                 broadcastStatus("wifi_connected")
             }
-
             override fun onLost(network: Network) {
-                LogManager.i(TAG, "Wi-Fi disconnected — pausing listener")
+                LogManager.w(TAG, "Wi-Fi disconnected")
                 broadcastStatus("wifi_disconnected")
             }
         }
-
-        wifiCallback?.let { connManager.registerNetworkCallback(request, it) }
+        cm.registerNetworkCallback(request, wifiCallback!!)
     }
 
     private fun unregisterWifiCallback() {
-        val connManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        wifiCallback?.let { connManager.unregisterNetworkCallback(it) }
+        wifiCallback?.let {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.unregisterNetworkCallback(it)
+        }
         wifiCallback = null
     }
 
@@ -402,59 +416,42 @@ class PhonectNetworkService : Service() {
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
             CHANNEL_ID,
-            getString(com.phonect.android.R.string.channel_name),
+            "Phonect Service",
             NotificationManager.IMPORTANCE_LOW,
         ).apply {
-            description = getString(com.phonect.android.R.string.channel_description)
+            description = "Phonect P2P unlock daemon notification"
         }
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(channel)
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.createNotificationChannel(channel)
     }
 
-    private fun buildNotification(text: String, showOngoing: Boolean = true): Notification {
+    private fun buildNotification(text: String, persistent: Boolean): Notification {
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("phonect")
+            .setContentTitle("Phonect")
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_menu_view)
-            .setOngoing(showOngoing)
+            .setSmallIcon(android.R.drawable.ic_menu_compass)
+            .setOngoing(persistent)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
     }
 
     private fun updateNotification(text: String) {
-        val notification = buildNotification(text)
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(NOTIFICATION_ID, notification)
+        val notification = buildNotification(text, persistent = true)
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.notify(NOTIFICATION_ID, notification)
     }
-
-    // ------------------------------------------------------------------
-    // Status broadcast
-    // ------------------------------------------------------------------
 
     private fun broadcastStatus(status: String) {
-        val intent = Intent(ACTION_BROADCAST_STATUS).apply {
-            putExtra(EXTRA_STATUS, status)
-        }
+        val intent = Intent(ACTION_BROADCAST_STATUS).putExtra(EXTRA_STATUS, status)
         sendBroadcast(intent)
     }
+}
 
-    // ------------------------------------------------------------------
-    // Hex helpers
-    // ------------------------------------------------------------------
-
-    private fun hexStringToByteArray(hex: String): ByteArray {
-        val cleaned = hex.replace(" ", "").lowercase()
-        require(cleaned.length % 2 == 0) { "Odd hex string length" }
-        return ByteArray(cleaned.length / 2) {
-            ((cleaned[it * 2].digitToInt(16) shl 4) + cleaned[it * 2 + 1].digitToInt(16)).toByte()
-        }
-    }
-
-    private fun ByteArray.toHex(): String {
-        val sb = StringBuilder(size * 2)
-        for (b in this) {
-            sb.append(String.format("%02x", b))
-        }
-        return sb.toString()
+/** Convert a hex string to a ByteArray. */
+private fun hexStringToByteArray(hex: String): ByteArray {
+    val len = hex.length
+    require(len % 2 == 0) { "Hex string must have even length" }
+    return ByteArray(len / 2) {
+        hex.substring(it * 2, it * 2 + 2).toInt(16).toByte()
     }
 }

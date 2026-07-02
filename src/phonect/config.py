@@ -4,20 +4,19 @@ phonect.config — Configuration file management for the daemon.
 Config location:  ``$XDG_CONFIG_HOME/phonect/config.toml``
 Defaults:         ``~/.config/phonect/config.toml``
 
+Zero-config discovery: the daemon no longer needs a static ``mobile_ip``.
+Instead it listens for incoming TCP connections from the phone and sends
+UDP broadcasts for device discovery.
+
 Example config::
 
-    [device]
-    mobile_ip = "192.168.1.100"
-    mobile_port = 9876
-
     [keys]
-    public_key = "/home/user/.config/phonect/trusted_device.pub"
     private_key = "/home/user/.config/phonect/pc_private.pem"
+    public_key = "/home/user/.config/phonect/trusted_device.pub"
 
     [daemon]
-    poll_interval_ms = 200
-    poll_timeout_seconds = 10
-    unlock_on_start = false
+    listen_port = 9876
+    pc_name = "my-laptop"
 
     [logging]
     level = "INFO"
@@ -37,10 +36,10 @@ from typing import Optional
 
 CONFIG_DIR_NAME = "phonect"
 CONFIG_FILE_NAME = "config.toml"
-DEFAULT_POLL_INTERVAL_MS = 200
-DEFAULT_POLL_TIMEOUT_SEC = 10
-DEFAULT_MOBILE_PORT = 9876
-DEFAULT_PC_KEY_NAME = "pc_private"
+DEFAULT_LISTEN_PORT = 9876
+UDP_DISCOVERY_PORT = 9875
+DEFAULT_POLL_INTERVAL_SEC = 0.3   # 300ms between UDP broadcasts
+DEFAULT_POLL_TIMEOUT_SEC = 15.0   # broadcast window
 DEFAULT_PC_KEY_BASENAME = "pc_private"
 
 
@@ -52,19 +51,19 @@ DEFAULT_PC_KEY_BASENAME = "pc_private"
 class DaemonConfig:
     """Runtime configuration for the daemon."""
 
-    # Device
-    mobile_ip: str = ""
-    mobile_port: int = DEFAULT_MOBILE_PORT
-
     # PC identity
     pc_name: str = ""
     private_key_path: Path = field(default_factory=lambda: Path("/nonexistent"))
 
-    # Keys
+    # Trusted phone key (populated by TOFU on first connection)
     public_key_path: Path = field(default_factory=lambda: Path("/nonexistent"))
 
+    # TCP listener (phone connects here)
+    listen_host: str = "0.0.0.0"
+    listen_port: int = DEFAULT_LISTEN_PORT
+
     # Behaviour
-    poll_interval: float = DEFAULT_POLL_INTERVAL_MS / 1000.0
+    poll_interval: float = DEFAULT_POLL_INTERVAL_SEC
     poll_timeout: float = DEFAULT_POLL_TIMEOUT_SEC
     unlock_on_start: bool = False
 
@@ -85,14 +84,19 @@ class DaemonConfig:
         return self.private_key_path.read_bytes()
 
     @property
-    def valid(self) -> bool:
-        """Check if the config has the minimum required fields for daemon mode."""
-        return bool(self.mobile_ip) and self.public_key_path.exists()
+    def has_pc_key(self) -> bool:
+        """PC has its own private key (needed for signing challenges)."""
+        return self.private_key_path.exists()
+
+    @property
+    def has_trusted_key(self) -> bool:
+        """A phone public key has been paired (TOFU completed)."""
+        return self.public_key_path.exists()
 
     @property
     def mutual_auth_ready(self) -> bool:
-        """Check if both mobile public key AND PC private key are available."""
-        return self.valid and self.private_key_path.exists()
+        """Both sides can authenticate each other."""
+        return self.has_pc_key and self.has_trusted_key
 
 
 # ---------------------------------------------------------------------------
@@ -134,11 +138,6 @@ def load_config(path: Optional[Path] = None) -> DaemonConfig:
 
     base = DaemonConfig(config_dir=cfg_path.parent)
 
-    # ── [device] ──────────────────────────────────────────────────────
-    dev = data.get("device", {})
-    base.mobile_ip = dev.get("mobile_ip", base.mobile_ip)
-    base.mobile_port = dev.get("mobile_port", base.mobile_port)
-
     # ── [keys] ────────────────────────────────────────────────────────
     keys = data.get("keys", {})
 
@@ -160,6 +159,8 @@ def load_config(path: Optional[Path] = None) -> DaemonConfig:
 
     # ── [daemon] ──────────────────────────────────────────────────────
     daemon = data.get("daemon", {})
+    base.listen_host = daemon.get("listen_host", base.listen_host)
+    base.listen_port = daemon.get("listen_port", base.listen_port)
     if "poll_interval_ms" in daemon:
         base.poll_interval = daemon["poll_interval_ms"] / 1000.0
     if "poll_timeout_seconds" in daemon:
@@ -186,28 +187,28 @@ def write_default_config(path: Optional[Path] = None) -> Path:
     template = """\
 # ── phonect daemon configuration ──────────────────────────────────────────
 # See https://github.com/zumuvik/phonect
-
-[device]
-# Static IP of the Android phone on your LAN
-mobile_ip = "192.168.1.100"
-# Port the phone's listener is bound to
-mobile_port = 9876
+#
+# Zero-config: no IP needed.  The daemon listens for phone connections
+# and broadcasts its presence via UDP discovery on port 9875.
 
 [keys]
-# Path to the trusted mobile device public key (PEM)
-public_key = "%s/trusted_device.pub"
-# Path to the PC's own private key (PEM) — for mutual authentication
+# Path to the PC's own private key (PEM) — generate with: phonect gen-keys
 private_key = "%s/pc_private.pem"
+# Path to the trusted mobile device public key (PEM) — auto-populated by
+# Trust-On-First-Use on the first successful connection
+public_key = "%s/trusted_device.pub"
 
 [daemon]
-# How often (ms) to retry TCP connect during wakeup polling
-poll_interval_ms = 200
-# Max polling window (seconds) before giving up
-poll_timeout_seconds = 10
-# Run one auth cycle when the daemon starts
-unlock_on_start = false
+# TCP port the daemon listens on (phone connects here)
+listen_port = 9876
 # Human-friendly PC name shown during pairing
 pc_name = "my-laptop"
+# Run one auth cycle when the daemon starts
+unlock_on_start = false
+# How often (ms) to send UDP discovery broadcasts after wake
+poll_interval_ms = 300
+# Max polling window (seconds) — phone must respond within this window
+poll_timeout_seconds = 15
 
 [logging]
 level = "INFO"

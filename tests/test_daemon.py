@@ -27,11 +27,12 @@ from phonect.handshake import HandshakeClient
 
 class TestConfig:
     def test_default_config_returns_minimal(self):
-        """load_config() with no file returns defaults with no IP."""
+        """load_config() with no file returns defaults (no keys)."""
         cfg = load_config(Path("/nonexistent/config.toml"))
-        assert cfg.mobile_ip == ""
-        assert cfg.mobile_port == 9876
-        assert cfg.valid is False  # no IP, no key
+        assert cfg.listen_port == 9876
+        assert cfg.listen_host == "0.0.0.0"
+        assert cfg.has_pc_key is False
+        assert cfg.has_trusted_key is False
 
     def test_write_and_load_config(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
@@ -43,10 +44,9 @@ class TestConfig:
             assert path.exists()
 
             cfg = load_config(path)
-            assert cfg.mobile_ip == "192.168.1.100"
-            assert cfg.mobile_port == 9876
-            assert cfg.poll_interval == 0.2  # 200ms converted to seconds
-            assert cfg.poll_timeout == 10.0
+            assert cfg.listen_port == 9876
+            assert cfg.poll_interval == 0.3  # 300ms converted to seconds
+            assert cfg.poll_timeout == 15.0
             assert cfg.log_level == "INFO"
         finally:
             path.unlink(missing_ok=True)
@@ -56,43 +56,42 @@ class TestConfig:
         with tempfile.TemporaryDirectory() as tmp:
             pub_key = Path(tmp) / "device.pub"
             pub_key.write_bytes(kp.public_key_pem)
+            priv_key = Path(tmp) / "pc_private.pem"
+            priv_key.write_bytes(kp.private_key_pem)
 
             config_path = Path(tmp) / "config.toml"
             config_path.write_text(f"""\
-[device]
-mobile_ip = "10.0.0.5"
-mobile_port = 9000
-
 [keys]
 public_key = "{pub_key}"
+private_key = "{priv_key}"
 
 [daemon]
+listen_port = 9000
 poll_interval_ms = 300
 poll_timeout_seconds = 15
 unlock_on_start = true
 """)
             cfg = load_config(config_path)
-            assert cfg.mobile_ip == "10.0.0.5"
-            assert cfg.mobile_port == 9000
+            assert cfg.listen_port == 9000
+            assert cfg.listen_host == "0.0.0.0"
             assert cfg.poll_interval == 0.3
             assert cfg.poll_timeout == 15.0
             assert cfg.unlock_on_start is True
-            assert cfg.valid is True
+            assert cfg.has_pc_key is True
+            assert cfg.has_trusted_key is True
+            assert cfg.mutual_auth_ready is True
 
     def test_config_invalid_no_key_file(self):
-        """Config points to a missing public key file → valid = False."""
+        """Config points to a missing public key file → has_trusted_key = False."""
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.toml"
             config_path.write_text("""\
-[device]
-mobile_ip = "10.0.0.5"
-
 [keys]
 public_key = "/nonexistent/key.pub"
 """)
             cfg = load_config(config_path)
-            assert cfg.mobile_ip == "10.0.0.5"
-            assert cfg.valid is False  # key file doesn't exist
+            assert cfg.has_trusted_key is False
+            assert cfg.has_pc_key is False
 
 
 # ======================================================================

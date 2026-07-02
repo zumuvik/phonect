@@ -1,10 +1,20 @@
 """
-phonect.daemon — Asyncio-based system daemon for P2P biometric unlock.
+phonect.daemon — Asyncio-based daemon for P2P biometric unlock via UDP discovery + TOFU.
 
-Integrates with ``systemd-logind`` via D-Bus (``PrepareForSleep`` signal).
-On resume-from-sleep the daemon aggressively polls the mobile device over TCP,
-runs the challenge-response handshake, and calls ``loginctl unlock-session``
-on success.
+Architecture
+============
+
+Instead of connecting to a static phone IP, the daemon:
+
+1. Listens on a TCP port (default 9876) for incoming phone connections.
+2. On resume-from-sleep (``PrepareForSleep`` D-Bus signal), sends UDP
+   discovery broadcasts on port 9875.
+3. A phone that hears the broadcast connects to the daemon over TCP.
+4. **Trust On First Use (TOFU)**: if the phone is unknown, both sides
+   exchange RSA public keys automatically — no manual config needed.
+5. After TOFU (or immediately for a known phone) the standard
+   challenge-response handshake runs; on success the daemon calls
+   ``loginctl unlock-session``.
 """
 
 from __future__ import annotations
@@ -12,12 +22,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import Callable, List, Optional, Set
+from typing import Callable, List, Optional
 
-from phonect.config import DaemonConfig, load_config
+from phonect.config import DaemonConfig, load_config, UDP_DISCOVERY_PORT
 from phonect.crypto import (
     generate_nonce,
     load_public_key,
@@ -25,17 +36,19 @@ from phonect.crypto import (
     verify_nonce,
     sign_nonce,
     fingerprint_from_public_key,
+    public_key_to_pem,
     rsa,
 )
 from phonect.protocol import (
     MAX_FRAME_SIZE,
     encode_frame,
-    decode_frame,
     make_challenge,
-    make_response,
+    make_pair_accept,
     validate_response,
+    validate_pair_hello,
     ProtocolError,
     ProtocolSecurityError,
+    MSG_PAIR_HELLO,
 )
 
 LOG = logging.getLogger("phonect.daemon")
@@ -49,17 +62,18 @@ DBUS_LOGIN1_OBJECT = "/org/freedesktop/login1"
 DBUS_LOGIN1_MANAGER = "org.freedesktop.login1.Manager"
 SIGNAL_PREPARE_FOR_SLEEP = "PrepareForSleep"
 
-HANDSHAKE_TIMEOUT = 10.0  # seconds waiting for mobile response
-UNLOCK_SESSION_MAX_ATTEMPTS = 3
+HANDSHAKE_TIMEOUT = 10.0  # seconds waiting for phone I/O
+DISCOVERY_MSG_PREFIX = "PHONECT_DISCOVERY:"
 
 
 # ---------------------------------------------------------------------------
 # Daemon
 # ---------------------------------------------------------------------------
 
+
 class PhonectDaemon:
     """
-    Async daemon for P2P biometric laptop unlock.
+    Async daemon for P2P biometric laptop unlock (UDP discovery + TOFU).
 
     Usage::
 
@@ -72,6 +86,14 @@ class PhonectDaemon:
         self.config = config
         self._running = False
         self._wakeup_event = asyncio.Event()
+
+        # TCP server reference (set during run())
+        self._tcp_server: Optional[asyncio.AbstractServer] = None
+
+        # Auth-flow coordination: _handle_connection signals this
+        # event so that _on_wakeup knows when to proceed.
+        self._auth_completed = asyncio.Event()
+        self._last_auth_ok = False
         self._auth_in_progress = False
 
         # D-Bus proxy – set during _connect_dbus()
@@ -82,33 +104,36 @@ class PhonectDaemon:
         # Override hook for tests (capture unlock commands)
         self._unlock_hook: Optional[Callable[[List[str]], None]] = None
 
-        # Load the trusted (mobile) public key
-        self._trusted_key: Optional[rsa.RSAPublicKey] = None
-        if config.valid:
-            try:
-                self._trusted_key = load_public_key(config.trusted_key_pem)
-            except Exception as exc:
-                LOG.error("Failed to load trusted public key: %s", exc)
-        else:
-            LOG.warning("Daemon config is incomplete — auth will not be possible")
-
-        # Load the PC private key for mutual authentication
+        # ── Load PC key pair ─────────────────────────────────────────
         self._pc_private_key: Optional[rsa.RSAPrivateKey] = None
         pk_path = config.private_key_path
         if pk_path and pk_path.is_file():
             try:
                 self._pc_private_key = load_private_key(config.pc_private_key_pem)
-                LOG.info("PC private key loaded for mutual auth")
+                LOG.info("PC private key loaded from %s", pk_path)
             except Exception as exc:
                 LOG.error("Failed to load PC private key: %s", exc)
         else:
-            LOG.info("No PC private key — mutual auth disabled (pair via TUI first)")
+            LOG.warning(
+                "No PC private key at %s — handshake will fail. "
+                "Run 'phonect gen-keys' first.", pk_path,
+            )
+
+        # ── Load trusted (phone) public key (optional — populated by TOFU) ──
+        self._trusted_key: Optional[rsa.RSAPublicKey] = None
+        if config.has_trusted_key:
+            try:
+                self._trusted_key = load_public_key(config.trusted_key_pem)
+                LOG.info("Trusted phone key loaded from %s", config.public_key_path)
+            except Exception as exc:
+                LOG.error("Failed to load trusted phone key: %s", exc)
 
         LOG.info(
-            "PhonectDaemon initialised (mobile=%s:%d, poll=%.1fs/%.1fs, mutual=%s)",
-            config.mobile_ip, config.mobile_port,
-            config.poll_interval, config.poll_timeout,
-            self._pc_private_key is not None,
+            "PhonectDaemon initialised (listen=%s:%d, %s)",
+            config.listen_host, config.listen_port,
+            "mutual auth ready" if config.mutual_auth_ready
+            else "awaiting phone pairing" if config.has_pc_key
+            else "no PC key",
         )
 
     # ------------------------------------------------------------------
@@ -116,27 +141,37 @@ class PhonectDaemon:
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
-        """Main entry point.  Connect D-Bus and enter the event loop."""
+        """Main entry point.  Start TCP server, connect D-Bus, enter loop."""
         LOG.info("Starting phonect daemon ...")
         self._running = True
 
-        # Connect D-Bus (system bus)
+        # 1. Start TCP listener for phone connections
+        try:
+            self._tcp_server = await asyncio.start_server(
+                self._handle_connection,
+                host=self.config.listen_host,
+                port=self.config.listen_port,
+            )
+            addr = self._tcp_server.sockets[0].getsockname()
+            LOG.info("TCP listener on %s:%d", addr[0], addr[1])
+        except OSError as exc:
+            LOG.critical("Cannot start TCP listener: %s", exc)
+            return
+
+        # 2. Connect D-Bus (system bus)
         try:
             await self._connect_dbus()
         except Exception as exc:
-            LOG.critical("D-Bus connection failed: %s", exc)
-            LOG.critical("Falling back to polling-only mode (no sleep detection)")
-            # We can still operate in polling-only mode with a wakeup trigger
+            LOG.warning("D-Bus connection failed: %s (polling-only mode)", exc)
 
-        # Optional initial unlock cycle
-        if self.config.unlock_on_start and self.config.valid:
+        # 3. Optional initial unlock cycle
+        if self.config.unlock_on_start and self.config.has_pc_key:
             LOG.info("Performing initial unlock-on-start ...")
             asyncio.create_task(self._on_wakeup())
 
         LOG.info("Daemon ready.  Waiting for resume-from-sleep events ...")
 
         try:
-            # Main loop: wait for wakeup events
             while self._running:
                 await self._wakeup_event.wait()
                 self._wakeup_event.clear()
@@ -144,11 +179,10 @@ class PhonectDaemon:
                 if not self._running:
                     break
 
-                if not self.config.valid:
-                    LOG.warning("Cannot run auth — config incomplete")
+                if not self.config.has_pc_key:
+                    LOG.warning("Cannot run auth — no PC private key")
                     continue
 
-                # Start auth flow in background (don't block the signal handler)
                 if not self._auth_in_progress:
                     asyncio.create_task(self._on_wakeup())
 
@@ -161,7 +195,7 @@ class PhonectDaemon:
         """Gracefully stop the daemon (called from signal handler)."""
         LOG.info("Shutdown requested")
         self._running = False
-        self._wakeup_event.set()  # unblock the main loop
+        self._wakeup_event.set()
 
     def trigger_wakeup(self) -> None:
         """Manually trigger a wakeup/auth cycle (for testing / SIGUSR1)."""
@@ -173,8 +207,7 @@ class PhonectDaemon:
     # ------------------------------------------------------------------
 
     async def _connect_dbus(self) -> None:
-        """Connect to the system D-Bus, introspect logind, subscribe to
-        ``PrepareForSleep``."""
+        """Connect to the system D-Bus, subscribe to ``PrepareForSleep``."""
         from dbus_next.aio import MessageBus
         from dbus_next import BusType
         from dbus_next.introspection import Node
@@ -182,7 +215,6 @@ class PhonectDaemon:
         self._bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
         LOG.debug("Connected to system D-Bus")
 
-        # Introspect logind to get the full interface definition
         introspection: Node = await self._bus.introspect(
             DBUS_LOGIN1_SERVICE, DBUS_LOGIN1_OBJECT,
         )
@@ -193,12 +225,15 @@ class PhonectDaemon:
             DBUS_LOGIN1_MANAGER,
         )
 
-        # Subscribe to PrepareForSleep signal
         self._login1_manager.on_prepare_for_sleep(self._on_prepare_for_sleep)
         LOG.info("Subscribed to %s.%s", DBUS_LOGIN1_MANAGER, SIGNAL_PREPARE_FOR_SLEEP)
 
     async def _cleanup(self) -> None:
-        """Disconnect D-Bus."""
+        """Stop TCP server and disconnect D-Bus."""
+        if self._tcp_server is not None:
+            self._tcp_server.close()
+            await self._tcp_server.wait_closed()
+            LOG.debug("TCP server stopped")
         if self._bus is not None:
             self._bus.disconnect()
             self._bus = None
@@ -222,81 +257,212 @@ class PhonectDaemon:
             self._wakeup_event.set()
 
     # ------------------------------------------------------------------
-    # Auth flow
+    # Wakeup / auth flow
     # ------------------------------------------------------------------
 
     async def _on_wakeup(self) -> None:
-        """Handle a wakeup event: poll mobile device and authenticate."""
+        """Handle wakeup: broadcast discovery, wait for phone auth."""
         if self._auth_in_progress:
             LOG.debug("Auth already in progress, skipping")
             return
         self._auth_in_progress = True
+        self._auth_completed.clear()
+        self._last_auth_ok = False
 
         try:
-            success = await self._poll_and_authenticate()
+            # Start UDP discovery broadcasts in the background
+            broadcast_task = asyncio.create_task(self._send_discovery_broadcasts())
 
-            if success:
+            # Wait for a phone to connect and complete auth
+            try:
+                await asyncio.wait_for(
+                    self._auth_completed.wait(),
+                    timeout=self.config.poll_timeout + 5.0,
+                )
+            except asyncio.TimeoutError:
+                LOG.warning("No phone responded during discovery window")
+            finally:
+                broadcast_task.cancel()
+                try:
+                    await broadcast_task
+                except asyncio.CancelledError:
+                    pass
+
+            if self._last_auth_ok:
                 LOG.info("✓ Authentication successful — unlocking session(s)")
                 self._unlock_sessions()
             else:
-                LOG.warning("✗ Authentication failed or timed out")
+                LOG.warning("✗ Authentication failed or no phone connected")
         finally:
             self._auth_in_progress = False
 
-    async def _poll_and_authenticate(self) -> bool:
+    async def _send_discovery_broadcasts(self) -> None:
         """
-        Aggressively poll the mobile device's TCP port.
+        Send UDP broadcast packets on port 9875 during the polling window.
 
-        Attempts a connection every ``poll_interval`` seconds for up to
-        ``poll_timeout`` seconds.  Once connected, runs the challenge-response
-        handshake.
+        Packet format: ``PHONECT_DISCOVERY:<pc_name>:<pc_fingerprint_prefix>``
 
-        Returns ``True`` if the mobile's signature was verified.
+        The phone extracts the PC's IP from the UDP source address and
+        connects to our TCP listener.
         """
-        host = self.config.mobile_ip
-        port = self.config.mobile_port
-        interval = self.config.poll_interval
+        if self._pc_private_key is None:
+            return
+
+        pc_name = self.config.pc_name or socket.gethostname()
+        fp = fingerprint_from_public_key(self._pc_private_key.public_key())
+        payload = f"{DISCOVERY_MSG_PREFIX}{pc_name}:{fp[:16]}"
+        data = payload.encode()
+
+        loop = asyncio.get_running_loop()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.setblocking(False)
+
         deadline = time.monotonic() + self.config.poll_timeout
-
-        LOG.info(
-            "Polling %s:%d (interval=%.1fs, timeout=%.1fs) ...",
-            host, port, interval, self.config.poll_timeout,
-        )
-
-        attempt = 0
-        while time.monotonic() < deadline and self._running:
-            attempt += 1
-            try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port),
-                    timeout=max(interval, 1.0),
-                )
-                LOG.info("TCP connection established (attempt #%d)", attempt)
-            except (ConnectionRefusedError, ConnectionError, OSError):
-                await asyncio.sleep(interval)
-                continue
-            except asyncio.TimeoutError:
-                await asyncio.sleep(interval)
-                continue
-
-            # Connection succeeded — run the handshake
-            try:
-                ok = await self._async_handshake(reader, writer)
-                return ok
-            except Exception as exc:
-                LOG.error("Handshake error: %s", exc)
-                # Connection may have failed mid-handshake — retry
-                await asyncio.sleep(interval)
-                continue
-            finally:
-                writer.close()
+        count = 0
+        try:
+            while time.monotonic() < deadline and self._running:
                 try:
-                    await writer.wait_closed()
-                except Exception:
-                    pass
+                    await loop.sock_sendto(
+                        sock, data, ("255.255.255.255", UDP_DISCOVERY_PORT),
+                    )
+                    count += 1
+                except OSError:
+                    pass  # network not ready yet
+                await asyncio.sleep(self.config.poll_interval)
+        finally:
+            sock.close()
+            LOG.debug("Discovery: sent %d broadcasts in %.1fs", count, self.config.poll_timeout)
 
-        LOG.warning("Polling timed out after %d attempts", attempt)
-        return False
+    # ------------------------------------------------------------------
+    # TCP connection handler
+    # ------------------------------------------------------------------
+
+    async def _handle_connection(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """
+        Handle an incoming phone TCP connection.
+
+        1. Read the first frame — expects ``pair_hello`` with phone's PEM key.
+        2. TOFU: save phone key if unknown, send ``pair_accept`` with PC key.
+        3. Challenge-response handshake.
+        4. Signal the wakeup handler with the result.
+        """
+        peer = writer.get_extra_info("peername", ("?", 0))
+        LOG.info("Phone connected from %s:%d", peer[0], peer[1])
+
+        try:
+            # 1. Read first frame
+            msg = await self._read_frame(reader, timeout=HANDSHAKE_TIMEOUT)
+            if msg is None:
+                LOG.warning("Empty frame from phone — closing")
+                return
+
+            msg_type = msg.get("type")
+            LOG.debug("Received message type: %s", msg_type)
+
+            # Only pair_hello is expected as the first message
+            if msg_type != MSG_PAIR_HELLO:
+                LOG.warning("Unexpected first message type: %s", msg_type)
+                return
+
+            # 2. Validate pair_hello
+            try:
+                hello = validate_pair_hello(msg)
+            except ProtocolError as exc:
+                LOG.warning("Invalid pair_hello: %s", exc)
+                return
+
+            phone_pem = hello["public_key_pem"]
+            phone_fp = hello["public_key_fingerprint"]
+            device_name = hello.get("device_name", "phone")
+
+            # 3. TOFU: save phone key if new
+            is_new = False
+            if not self._is_known_key(phone_fp):
+                self._save_phone_key(phone_pem)
+                # Reload trusted key so _async_handshake can use it
+                try:
+                    self._trusted_key = load_public_key(self.config.trusted_key_pem)
+                    LOG.info(
+                        "TOFU: paired with %s (%s …)",
+                        device_name, phone_fp[:16],
+                    )
+                    is_new = True
+                except Exception as exc:
+                    LOG.error("TOFU: failed to reload phone key: %s", exc)
+                    return
+            else:
+                LOG.debug("Phone already known: %s …", phone_fp[:16])
+
+            # 4. Send pair_accept with PC's public key
+            if self._pc_private_key is not None:
+                pc_pem = public_key_to_pem(self._pc_private_key.public_key()).decode()
+                pc_fp = fingerprint_from_public_key(self._pc_private_key.public_key())
+                accept = make_pair_accept(hello["session_id"], pc_pem, pc_fp)
+                writer.write(encode_frame(accept))
+                await writer.drain()
+            else:
+                LOG.warning("No PC private key — cannot send pair_accept")
+                return
+
+            # 5. Challenge-response
+            ok = await self._async_handshake(reader, writer)
+            self._last_auth_ok = ok
+
+            if ok:
+                LOG.info(
+                    "✓ Handshake SUCCESS — device=%s fp=%s%s",
+                    device_name, phone_fp[:16],
+                    " (newly paired)" if is_new else "",
+                )
+            else:
+                LOG.warning(
+                    "✗ Handshake FAILED — device=%s fp=%s",
+                    device_name, phone_fp[:16],
+                )
+
+        except (asyncio.TimeoutError, ConnectionError) as exc:
+            LOG.warning("Connection error with %s: %s", peer[0], exc)
+            self._last_auth_ok = False
+        except ProtocolSecurityError as exc:
+            LOG.error("Security violation from %s: %s", peer[0], exc)
+            self._last_auth_ok = False
+        except Exception as exc:
+            LOG.exception("Unexpected error handling %s: %s", peer[0], exc)
+            self._last_auth_ok = False
+        finally:
+            self._auth_completed.set()
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # TOFU helpers
+    # ------------------------------------------------------------------
+
+    def _save_phone_key(self, pem: str) -> None:
+        """Persist the phone's public key PEM to ``config.public_key_path``."""
+        path = self.config.public_key_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(pem)
+        LOG.info("Phone public key saved to %s", path)
+
+    def _is_known_key(self, fingerprint: str) -> bool:
+        """Check whether *fingerprint* matches the currently trusted key."""
+        if self._trusted_key is None:
+            return False
+        our_fp = fingerprint_from_public_key(self._trusted_key)
+        return our_fp == fingerprint
+
+    # ------------------------------------------------------------------
+    # Challenge-response handshake
+    # ------------------------------------------------------------------
 
     async def _async_handshake(
         self,
@@ -307,10 +473,10 @@ class PhonectDaemon:
         Perform the challenge-response handshake over an established TCP
         connection (async version of ``HandshakeServer.accept_and_verify``).
 
-        Returns ``True`` if the response signature is valid.
+        Returns ``True`` if the phone's response signature is valid.
         """
         if self._trusted_key is None:
-            LOG.error("No trusted public key loaded — cannot verify")
+            LOG.error("No trusted phone key loaded — cannot verify")
             return False
 
         # 1. Send challenge (with mutual-auth fields if PC private key loaded)
@@ -343,7 +509,6 @@ class PhonectDaemon:
             return False
         except ProtocolSecurityError as exc:
             LOG.error("Security violation in response frame: %s", exc)
-            writer.close()
             return False
 
         if msg is None:
@@ -366,13 +531,13 @@ class PhonectDaemon:
 
         if valid:
             LOG.info(
-                "✓ Handshake SUCCESS — device=%s fp=%s",
+                "✓ Signature valid — device=%s fp=%s",
                 validated.get("device_name", "?"),
                 validated.get("public_key_fingerprint", "")[:16],
             )
         else:
             LOG.warning(
-                "✗ Handshake FAILED — signature mismatch (device=%s)",
+                "✗ Signature mismatch — device=%s",
                 validated.get("device_name", "?"),
             )
 
@@ -428,7 +593,6 @@ class PhonectDaemon:
             LOG.info("Running: %s", " ".join(cmd))
 
             if self._unlock_hook:
-                # Test hook
                 self._unlock_hook(cmd)
                 continue
 
@@ -452,12 +616,7 @@ class PhonectDaemon:
                 LOG.error("loginctl not found — is systemd installed?")
 
     def _get_active_session_ids(self) -> List[str]:
-        """
-        Get the active session ID(s) for the current user via loginctl.
-
-        Returns a list of session IDs belonging to the current user
-        that have ``seat = seat0`` (local graphical sessions).
-        """
+        """Get active session IDs for the current user on seat0."""
         try:
             result = subprocess.run(
                 ["loginctl", "--no-legend", "list-sessions"],
@@ -470,8 +629,6 @@ class PhonectDaemon:
         sessions: List[str] = []
 
         for line in result.stdout.strip().splitlines():
-            # Format: <session_id> <uid> <user> <seat> <type>
-            # Example: "2  1000  zumuvik  seat0  wayland"
             parts = line.strip().split()
             if len(parts) >= 5:
                 sid, _, user, seat = parts[0], parts[1], parts[2], parts[3]
@@ -485,6 +642,7 @@ class PhonectDaemon:
 # CLI entry-point helper
 # ---------------------------------------------------------------------------
 
+
 async def run_daemon(
     config_path: Optional[Path] = None,
     foreground: bool = False,
@@ -497,17 +655,10 @@ async def run_daemon(
     config = load_config(config_path)
     _configure_logging(config.log_level)
 
-    if not config.valid:
-        pk_status = (
-            str(config.public_key_path)
-            if config.public_key_path.exists() and config.public_key_path.is_file()
-            else "MISSING"
-        )
+    if not config.has_pc_key:
         LOG.warning(
-            "Config incomplete (mobile_ip=%r, public_key=%s). "
-            "Run 'phonect init-config' to create a template.",
-            config.mobile_ip,
-            pk_status,
+            "No PC private key configured. "
+            "Run 'phonect gen-keys' then update config [keys]private_key."
         )
 
     daemon = PhonectDaemon(config)
@@ -521,7 +672,7 @@ async def run_daemon(
                 daemon.stop,
             )
         except (ValueError, AttributeError, NotImplementedError):
-            pass  # Windows or unsupported
+            pass
 
     # Handle SIGUSR1 for manual wakeup trigger
     try:
@@ -536,7 +687,7 @@ async def run_daemon(
 
 
 def _configure_logging(level: str) -> None:
-    """Configure the logging handler (no syslog for now)."""
+    """Configure the logging handler."""
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",

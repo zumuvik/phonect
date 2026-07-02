@@ -19,32 +19,22 @@ object ProtocolHandler {
 
     private val gson = Gson()
 
-    /** Encode a [ResponseMessage] into a length-prefixed frame. */
-    fun encodeFrame(response: ResponseMessage): ByteArray {
-        val json = gson.toJson(response)
-        val payload = json.toByteArray(Charsets.UTF_8)
-        val header = ByteBuffer.allocate(4).putInt(payload.size).array()
-        return header + payload
-    }
-
-    /** Encode an [ErrorMessage] into a length-prefixed frame. */
-    fun encodeError(error: ErrorMessage): ByteArray {
-        val json = gson.toJson(error)
+    /** Encode any message into a length-prefixed frame. */
+    fun encodeFrame(obj: Any): ByteArray {
+        val json = gson.toJson(obj)
         val payload = json.toByteArray(Charsets.UTF_8)
         val header = ByteBuffer.allocate(4).putInt(payload.size).array()
         return header + payload
     }
 
     /**
-     * Read one complete frame from [inputStream].
+     * Read one complete frame from [inputStream] and parse as [T].
      *
-     * @return decoded [ChallengeMessage] or null if stream closed / invalid.
-     * @throws SocketException on connection reset.
-     * @throws IOException on I/O errors.
+     * @return decoded message or null if stream closed.
      * @throws SecurityException if frame exceeds [MAX_FRAME_SIZE].
      */
     @Throws(IOException::class, SecurityException::class)
-    fun readChallenge(inputStream: InputStream): ChallengeMessage? {
+    inline fun <reified T : Any> readFrame(inputStream: InputStream): T? {
         // 1. Read 4-byte header
         val header = ByteArray(FRAME_HEADER_SIZE)
         readExactly(inputStream, header) ?: return null
@@ -64,32 +54,42 @@ object ProtocolHandler {
 
         // 4. Parse JSON
         val json = String(payload, Charsets.UTF_8)
-        val msg = gson.fromJson(json, ChallengeMessage::class.java)
+        return gson.fromJson(json, T::class.java)
+    }
 
-        // 5. Validate
+    // ------------------------------------------------------------------
+    // Typed convenience methods
+    // ------------------------------------------------------------------
+
+    fun readChallenge(inputStream: InputStream): ChallengeMessage? {
+        val msg = readFrame<ChallengeMessage>(inputStream) ?: return null
         if (msg.type != MSG_CHALLENGE || msg.nonce.isBlank() || msg.session_id.isBlank()) {
             return null
         }
-
         return msg
     }
 
-    /**
-     * Send a [ResponseMessage] over [outputStream].
-     */
+    fun readPairAccept(inputStream: InputStream): PairAcceptMessage? {
+        val msg = readFrame<PairAcceptMessage>(inputStream) ?: return null
+        if (msg.type != MSG_PAIR_ACCEPT || msg.public_key_pem.isBlank()) {
+            return null
+        }
+        return msg
+    }
+
     fun sendResponse(outputStream: OutputStream, response: ResponseMessage) {
-        val frame = encodeFrame(response)
-        outputStream.write(frame)
+        outputStream.write(encodeFrame(response))
         outputStream.flush()
     }
 
-    /**
-     * Send an [ErrorMessage] over [outputStream].
-     */
+    fun sendPairHello(outputStream: OutputStream, hello: PairHelloMessage) {
+        outputStream.write(encodeFrame(hello))
+        outputStream.flush()
+    }
+
     fun sendError(outputStream: OutputStream, sessionId: String, reason: String) {
         val error = ErrorMessage(session_id = sessionId, reason = reason)
-        val frame = encodeError(error)
-        outputStream.write(frame)
+        outputStream.write(encodeFrame(error))
         outputStream.flush()
     }
 

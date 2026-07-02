@@ -38,9 +38,11 @@ PROTOCOL_VERSION = 1
 # Message types
 # ---------------------------------------------------------------------------
 
-MSG_CHALLENGE = "challenge"         # PC → Mobile
-MSG_RESPONSE = "response"           # Mobile → PC
-MSG_ERROR = "error"                 # either direction
+MSG_CHALLENGE = "challenge"           # PC → Mobile
+MSG_RESPONSE = "response"             # Mobile → PC
+MSG_ERROR = "error"                   # either direction
+MSG_PAIR_HELLO = "pair_hello"        # Mobile → PC (TOFU first contact)
+MSG_PAIR_ACCEPT = "pair_accept"      # PC → Mobile (TOFU response)
 
 # ---------------------------------------------------------------------------
 # Security limits
@@ -174,6 +176,49 @@ def make_error(session_id: str, reason: str) -> dict:
     }
 
 
+def make_pair_hello(
+    public_key_pem: str,
+    public_key_fingerprint: str,
+    device_name: str = "android-phone",
+    session_id: Optional[str] = None,
+) -> dict:
+    """
+    Build a pair_hello message (Mobile → PC).
+
+    Sent by the phone on first TCP connection to an unknown PC.
+    Carries the phone's RSA public key so the PC can store it
+    (Trust On First Use).
+    """
+    return {
+        "version": PROTOCOL_VERSION,
+        "type": MSG_PAIR_HELLO,
+        "session_id": session_id or uuid.uuid4().hex,
+        "public_key_pem": public_key_pem,
+        "public_key_fingerprint": public_key_fingerprint,
+        "device_name": device_name,
+    }
+
+
+def make_pair_accept(
+    session_id: str,
+    public_key_pem: str,
+    public_key_fingerprint: str,
+) -> dict:
+    """
+    Build a pair_accept message (PC → Mobile).
+
+    Response to ``pair_hello``.  Carries the PC's RSA public key
+    so the phone can store it.
+    """
+    return {
+        "version": PROTOCOL_VERSION,
+        "type": MSG_PAIR_ACCEPT,
+        "session_id": session_id,
+        "public_key_pem": public_key_pem,
+        "public_key_fingerprint": public_key_fingerprint,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Validation helpers
 # ---------------------------------------------------------------------------
@@ -234,4 +279,30 @@ def validate_response(msg: dict) -> dict:
             f"(RSA-4096 PSS/SHA-512)"
         )
 
+    return msg
+
+
+def validate_pair_hello(msg: dict) -> dict:
+    """Validate a pair_hello message."""
+    if msg.get("type") != MSG_PAIR_HELLO:
+        raise ProtocolError(f"Expected '{MSG_PAIR_HELLO}', got '{msg.get('type')}'")
+    if "public_key_pem" not in msg:
+        raise ProtocolError("Missing 'public_key_pem' in pair_hello")
+    if "public_key_fingerprint" not in msg:
+        raise ProtocolError("Missing 'public_key_fingerprint' in pair_hello")
+    if "session_id" not in msg:
+        raise ProtocolError("Missing 'session_id' in pair_hello")
+    return msg
+
+
+def validate_pair_accept(msg: dict) -> dict:
+    """Validate a pair_accept message."""
+    if msg.get("type") != MSG_PAIR_ACCEPT:
+        raise ProtocolError(f"Expected '{MSG_PAIR_ACCEPT}', got '{msg.get('type')}'")
+    if "public_key_pem" not in msg:
+        raise ProtocolError("Missing 'public_key_pem' in pair_accept")
+    if "public_key_fingerprint" not in msg:
+        raise ProtocolError("Missing 'public_key_fingerprint' in pair_accept")
+    if "session_id" not in msg:
+        raise ProtocolError("Missing 'session_id' in pair_accept")
     return msg

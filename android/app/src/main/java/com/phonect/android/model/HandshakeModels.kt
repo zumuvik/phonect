@@ -1,5 +1,7 @@
 package com.phonect.android.model
 
+import android.os.Build
+
 /**
  * Wire-format messages — mirrors phonect.protocol on the Python side.
  *
@@ -9,11 +11,18 @@ package com.phonect.android.model
 const val PROTOCOL_VERSION = 1
 const val FRAME_HEADER_SIZE = 4   // uint32 big-endian
 const val MAX_FRAME_SIZE = 65_536 // 64 KB safety limit
+const val UDP_DISCOVERY_PORT = 9875
+const val PC_LISTEN_PORT = 9876
 
 // Message types (must match Python phonect.protocol)
 const val MSG_CHALLENGE = "challenge"
 const val MSG_RESPONSE = "response"
 const val MSG_ERROR = "error"
+const val MSG_PAIR_HELLO = "pair_hello"
+const val MSG_PAIR_ACCEPT = "pair_accept"
+
+// Discovery packet prefix
+const val DISCOVERY_PREFIX = "PHONECT_DISCOVERY:"
 
 // ---------------------------------------------------------------------------
 // Kotlin data classes (serialised with Gson)
@@ -25,8 +34,8 @@ data class ChallengeMessage(
     val type: String = MSG_CHALLENGE,
     val session_id: String = "",
     val nonce: String = "",                       // hex-encoded 32 bytes
-    val pc_key_fingerprint: String? = null,        // future: mutual auth
-    val pc_signature: String? = null,              // future: mutual auth
+    val pc_key_fingerprint: String? = null,        // mutual auth
+    val pc_signature: String? = null,              // mutual auth
 )
 
 /** Outgoing signed response from phone. */
@@ -47,12 +56,40 @@ data class ErrorMessage(
     val reason: String = "",
 )
 
+/**
+ * First message from phone to PC after TCP connect.
+ *
+ * Carries the phone's RSA public key so the PC can store it
+ * (Trust On First Use).
+ */
+data class PairHelloMessage(
+    val version: Int = PROTOCOL_VERSION,
+    val type: String = MSG_PAIR_HELLO,
+    val session_id: String = "",
+    val public_key_pem: String = "",
+    val public_key_fingerprint: String = "",
+    val device_name: String = Build.MODEL,
+)
+
+/**
+ * PC's response to [PairHelloMessage].
+ *
+ * Carries the PC's RSA public key so the phone can store it.
+ */
+data class PairAcceptMessage(
+    val version: Int = PROTOCOL_VERSION,
+    val type: String = MSG_PAIR_ACCEPT,
+    val session_id: String = "",
+    val public_key_pem: String = "",
+    val public_key_fingerprint: String = "",
+)
+
 /** Paired PC record — persisted in shared preferences. */
 data class PairedPc(
     val name: String,
     val hostname: String,
     val ipAddress: String,
-    val port: Int = 9876,
+    val port: Int = PC_LISTEN_PORT,
     val publicKeyPem: String,
     val publicKeyFingerprint: String,
 )
