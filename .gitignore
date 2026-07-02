@@ -27,5 +27,11 @@ android/captures/
 *.iml
 .idea/
 
+# Agent instructions (local per-developer, not project-tracked)
+AGENTS.md
+CLAUDE.md
+.cursorrules
+.cursor/
+
 # Temp
 /tmp/

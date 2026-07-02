@@ -1,9 +1,13 @@
 package com.phonect.android.crypto
 
 import android.security.keystore.*
+import android.security.keystore.StrongBoxUnavailableException
+import android.util.Log
 import androidx.biometric.BiometricPrompt
 import java.security.*
 import java.security.spec.PSSParameterSpec
+import java.security.spec.X509EncodedKeySpec
+import java.util.Base64
 
 /**
  * Manages RSA-4096 key pair generation and signing via Android Hardware-backed
@@ -31,6 +35,7 @@ import java.security.spec.PSSParameterSpec
 class CryptoManager(private val appContext: android.content.Context) {
 
     companion object {
+        private const val TAG = "CryptoManager"
         const val KEY_ALIAS = "phonect_rsa_key"
         const val KEY_SIZE = 4096
         const val SIGNATURE_ALGORITHM = "SHA512withRSA/PSS"
@@ -55,29 +60,44 @@ class CryptoManager(private val appContext: android.content.Context) {
      */
     fun generateKeyIfNeeded(alias: String = KEY_ALIAS) {
         if (keyStore.containsAlias(alias)) return
+        generateKey(alias, preferStrongBox = true)
+    }
 
-        val keyGen = KeyPairGenerator.getInstance(
-            KeyProperties.KEY_ALGORITHM_RSA,
-            PROVIDER
-        )
+    /**
+     * Generate an RSA-4096 key pair, optionally preferring StrongBox.
+     *
+     * If StrongBox is requested but unavailable, falls back to TEE (Trusted
+     * Execution Environment) silently.
+     */
+    private fun generateKey(alias: String, preferStrongBox: Boolean) {
+        try {
+            val spec = buildKeySpec(alias, preferStrongBox)
+            val keyGen = KeyPairGenerator.getInstance(
+                KeyProperties.KEY_ALGORITHM_RSA,
+                PROVIDER
+            )
+            keyGen.initialize(spec)
+            keyGen.generateKeyPair()
+        } catch (e: StrongBoxUnavailableException) {
+            if (preferStrongBox) {
+                Log.w(TAG, "StrongBox unavailable, falling back to TEE")
+                generateKey(alias, preferStrongBox = false)
+            } else {
+                throw e
+            }
+        }
+    }
 
-        val spec = KeyGenParameterSpec.Builder(
-            alias,
-            KeyProperties.PURPOSE_SIGN
-        )
+    private fun buildKeySpec(alias: String, strongBox: Boolean): KeyGenParameterSpec {
+        return KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN)
             .setKeySize(KEY_SIZE)
             .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PSS)
             .setDigests(KeyProperties.DIGEST_SHA512)
-            // Biometric binding --------------------------------------------------
-            .setUserAuthenticationRequired(true)                 // must auth
-            .setUserAuthenticationValidityDurationSeconds(-1)    // auth per use
-            .setInvalidatedByBiometricEnrollment(true)           // new finger = key gone
-            // Hardware binding ----------------------------------------------------
-            .setIsStrongBoxBacked(true)                          // prefer StrongBox/TEE
+            .setUserAuthenticationRequired(true)
+            .setUserAuthenticationValidityDurationSeconds(-1)
+            .setInvalidatedByBiometricEnrollment(true)
+            .setIsStrongBoxBacked(strongBox)
             .build()
-
-        keyGen.initialize(spec)
-        keyGen.generateKeyPair()
     }
 
     // ------------------------------------------------------------------

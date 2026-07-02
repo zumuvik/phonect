@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Shield/lock icon representing security -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,24L26,38v16c0,16.6 10.2,32 28,38c17.8,-6 28,-21.4 28,-38V38L54,24z
+                          M54,66h-8v-8h8v8z
+                          M62,58l-4,4l-8,-8v-4l8,-8l4,4l-4,4l4,4z" />
+</vector>
