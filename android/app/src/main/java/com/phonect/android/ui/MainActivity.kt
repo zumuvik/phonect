@@ -13,6 +13,7 @@ import com.phonect.android.R
 import com.phonect.android.biometric.BiometricHandler
 import com.phonect.android.biometric.BiometricResult
 import com.phonect.android.crypto.CryptoManager
+import com.phonect.android.logging.LogManager
 import com.phonect.android.network.PhonectNetworkService
 
 /**
@@ -23,6 +24,7 @@ import com.phonect.android.network.PhonectNetworkService
  * - Status display
  * - Biometric readiness check
  * - Public key management (future: QR-code pairing)
+ * - Real-time log display and share
  */
 class MainActivity : AppCompatActivity() {
 
@@ -31,8 +33,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private lateinit var fingerprintStatus: TextView
     private lateinit var publicKeyFingerprint: TextView
+    private lateinit var logView: TextView
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
+    private lateinit var shareButton: Button
 
     private var serviceRunning = false
 
@@ -40,6 +44,13 @@ class MainActivity : AppCompatActivity() {
         override fun onReceive(context: Context, intent: Intent) {
             val status = intent.getStringExtra(PhonectNetworkService.EXTRA_STATUS) ?: return
             runOnUiThread { updateStatus(status) }
+        }
+    }
+
+    private val logReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val line = intent.getStringExtra(LogManager.EXTRA_LOG_LINE) ?: return
+            runOnUiThread { appendLog(line) }
         }
     }
 
@@ -57,7 +68,8 @@ class MainActivity : AppCompatActivity() {
         // handshake with "no_ui_context".
         PhonectNetworkService.setCurrentActivity(this)
 
-        // Initialise managers
+        // Initialise managers + logger
+        LogManager.init(this)
         cryptoManager = CryptoManager(applicationContext)
         biometricHandler = BiometricHandler(this)
 
@@ -65,15 +77,25 @@ class MainActivity : AppCompatActivity() {
         statusText = findViewById(R.id.status_text)
         fingerprintStatus = findViewById(R.id.fingerprint_status)
         publicKeyFingerprint = findViewById(R.id.public_key_fingerprint)
+        logView = findViewById(R.id.log_view)
         startButton = findViewById(R.id.btn_start_service)
         stopButton = findViewById(R.id.btn_stop_service)
+        shareButton = findViewById(R.id.btn_share_logs)
 
         startButton.setOnClickListener { startService() }
         stopButton.setOnClickListener { stopService() }
+        shareButton.setOnClickListener { shareLogs() }
 
         // Register status receiver
         LocalBroadcastManager.getInstance(this)
             .registerReceiver(statusReceiver, IntentFilter(PhonectNetworkService.ACTION_BROADCAST_STATUS))
+
+        // Register log entry receiver
+        LocalBroadcastManager.getInstance(this)
+            .registerReceiver(logReceiver, IntentFilter(LogManager.ACTION_LOG_ENTRY))
+
+        // Load existing logs
+        loadExistingLogs()
 
         // Initial UI state
         updateBiometricStatus()
@@ -88,6 +110,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         LocalBroadcastManager.getInstance(this).unregisterReceiver(statusReceiver)
+        LocalBroadcastManager.getInstance(this).unregisterReceiver(logReceiver)
         super.onDestroy()
     }
 
@@ -159,6 +182,45 @@ class MainActivity : AppCompatActivity() {
             "Public key: ${fp.take(16)}…"
         } else {
             "No key generated yet"
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Log display
+    // ------------------------------------------------------------------
+
+    /**
+     * Append a single log line to the on-screen log view and auto-scroll.
+     */
+    private fun appendLog(line: String) {
+        logView.append(line + "\n")
+        // Auto-scroll to bottom
+        val parent = logView.parent as? ScrollView
+        parent?.post { parent.fullScroll(ScrollView.FOCUS_DOWN) }
+    }
+
+    /**
+     * Load the full log file content into the log view on startup.
+     */
+    private fun loadExistingLogs() {
+        val content = LogManager.getLogContent()
+        if (content.isNotBlank()) {
+            logView.text = content
+            // Scroll to bottom
+            val parent = logView.parent as? ScrollView
+            parent?.post { parent.fullScroll(ScrollView.FOCUS_DOWN) }
+        }
+    }
+
+    /**
+     * Share the log file via Android's share sheet (Intent.ACTION_SEND).
+     */
+    private fun shareLogs() {
+        val intent = LogManager.createShareIntent()
+        if (intent != null) {
+            startActivity(Intent.createChooser(intent, "Share phonect logs"))
+        } else {
+            Toast.makeText(this, "LogManager not initialised", Toast.LENGTH_SHORT).show()
         }
     }
 }

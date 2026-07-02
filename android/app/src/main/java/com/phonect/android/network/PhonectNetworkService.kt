@@ -11,11 +11,11 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Build
 import android.os.IBinder
-import android.util.Log
 import androidx.biometric.BiometricPrompt
 import androidx.core.app.NotificationCompat
 import com.phonect.android.biometric.BiometricHandler
 import com.phonect.android.crypto.CryptoManager
+import com.phonect.android.logging.LogManager
 import com.phonect.android.model.*
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
@@ -95,6 +95,7 @@ class PhonectNetworkService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        LogManager.init(this)
         cryptoManager = CryptoManager(this)
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         createNotificationChannel()
@@ -103,11 +104,11 @@ class PhonectNetworkService : Service() {
         // the first run, must not block the main thread (would cause ANR).
         serviceScope.launch {
             cryptoManager.generateKeyIfNeeded()
-            Log.i(TAG, "Key generation completed")
+            LogManager.i(TAG, "Key generation completed")
         }
 
         registerWifiCallback()
-        Log.i(TAG, "Service created")
+        LogManager.i(TAG, "Service created")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -189,7 +190,7 @@ class PhonectNetworkService : Service() {
                 serverSocket = ServerSocket(PORT_DEFAULT)
                 serverSocket?.reuseAddress = true
                 val port = serverSocket?.localPort ?: PORT_DEFAULT
-                Log.i(TAG, "Listening on port $port")
+                LogManager.i(TAG, "Listening on port $port")
                 updateNotification("Listening on port $port")
                 broadcastStatus("listening:$port")
 
@@ -198,17 +199,17 @@ class PhonectNetworkService : Service() {
                         serverSocket?.accept()
                     } catch (e: SocketException) {
                         if (!isActive) break
-                        Log.e(TAG, "Accept failed", e)
+                        LogManager.e(TAG, "Accept failed", e)
                         continue
                     } ?: break
 
                     val peerIp = clientSocket.inetAddress.hostAddress
-                    Log.i(TAG, "Connection from $peerIp")
+                    LogManager.i(TAG, "Connection from $peerIp")
                     updateNotification("Connection from $peerIp")
 
                     // ── Security: validate peer IP before any prompt ──────
                     if (!isTrustedPeer(clientSocket.inetAddress)) {
-                        Log.w(TAG, "Rejected untrusted peer: $peerIp")
+                        LogManager.w(TAG, "Rejected untrusted peer: $peerIp")
                         try { clientSocket.close() } catch (_: Exception) {}
                         continue
                     }
@@ -217,11 +218,11 @@ class PhonectNetworkService : Service() {
                 }
 
             } catch (e: Exception) {
-                Log.e(TAG, "Listener error", e)
+                LogManager.e(TAG, "Listener error", e)
                 updateNotification("Error: ${e.message ?: "unknown"}")
                 broadcastStatus("error")
             } finally {
-                Log.i(TAG, "Listener stopped")
+                LogManager.i(TAG, "Listener stopped")
                 updateNotification("Service stopped")
                 broadcastStatus("stopped")
             }
@@ -251,7 +252,7 @@ class PhonectNetworkService : Service() {
             // 1. Read challenge frame
             val challenge = ProtocolHandler.readChallenge(input)
             if (challenge == null) {
-                Log.w(TAG, "Invalid challenge from $peerIp")
+                LogManager.w(TAG, "Invalid challenge from $peerIp")
                 ProtocolHandler.sendError(output, "", "invalid_challenge")
                 return
             }
@@ -259,24 +260,24 @@ class PhonectNetworkService : Service() {
             val nonceBytes = try {
                 hexStringToByteArray(challenge.nonce)
             } catch (e: IllegalArgumentException) {
-                Log.e(TAG, "Invalid nonce hex from $peerIp")
+                LogManager.e(TAG, "Invalid nonce hex from $peerIp")
                 ProtocolHandler.sendError(output, challenge.session_id, "invalid_nonce")
                 return
             }
 
             if (nonceBytes.size != 32) {
-                Log.e(TAG, "Nonce length ${nonceBytes.size} != 32 from $peerIp")
+                LogManager.e(TAG, "Nonce length ${nonceBytes.size} != 32 from $peerIp")
                 ProtocolHandler.sendError(output, challenge.session_id, "nonce_length_mismatch")
                 return
             }
 
-            Log.i(TAG, "Challenge received: session=${challenge.session_id}, from=$peerIp")
+            LogManager.i(TAG, "Challenge received: session=${challenge.session_id}, from=$peerIp")
 
             // ── Mutual auth: verify PC signature (if present) ─────────────
             if (challenge.pc_signature != null && challenge.pc_key_fingerprint != null) {
                 val trustedPc = findTrustedPeer(clientSocket.inetAddress)
                 if (trustedPc == null && getTrustedPcs().isNotEmpty()) {
-                    Log.w(TAG, "Mutual-auth: no trusted PC record for $peerIp")
+                    LogManager.w(TAG, "Mutual-auth: no trusted PC record for $peerIp")
                     ProtocolHandler.sendError(output, challenge.session_id, "untrusted_peer")
                     return
                 }
@@ -289,18 +290,18 @@ class PhonectNetworkService : Service() {
                         pcPublicKeyPem = trustedPc.publicKeyPem,
                     )
                     if (!pcValid) {
-                        Log.w(TAG, "Mutual-auth FAILED — PC signature invalid for $peerIp")
+                        LogManager.w(TAG, "Mutual-auth FAILED — PC signature invalid for $peerIp")
                         ProtocolHandler.sendError(output, challenge.session_id, "pc_auth_failed")
                         return
                     }
-                    Log.i(TAG, "Mutual-auth OK — PC signature verified (${trustedPc.name})")
+                    LogManager.i(TAG, "Mutual-auth OK — PC signature verified (${trustedPc.name})")
                 }
             }
 
             // 2. Get the current Activity for BiometricPrompt
             val activity = getCurrentActivity() as? androidx.fragment.app.FragmentActivity
             if (activity == null) {
-                Log.w(TAG, "No Activity registered — cannot show biometric prompt")
+                LogManager.w(TAG, "No Activity registered — cannot show biometric prompt")
                 ProtocolHandler.sendError(output, challenge.session_id, "no_ui_context")
                 return
             }
@@ -320,7 +321,7 @@ class PhonectNetworkService : Service() {
             )
 
             if (authResult == null) {
-                Log.w(TAG, "Biometric declined by user")
+                LogManager.w(TAG, "Biometric declined by user")
                 ProtocolHandler.sendError(output, challenge.session_id, "biometric_declined")
                 return
             }
@@ -334,7 +335,7 @@ class PhonectNetworkService : Service() {
             // 5. Sign the nonce (update + sign)
             validatedSignature.update(nonceBytes)
             val signedBytes = validatedSignature.sign()
-            Log.i(TAG, "Nonce signed: ${signedBytes.size} bytes")
+            LogManager.i(TAG, "Nonce signed: ${signedBytes.size} bytes")
 
             // 6. Build and send response
             val fingerprint = cryptoManager.getPublicKeyFingerprint() ?: "unknown"
@@ -346,16 +347,16 @@ class PhonectNetworkService : Service() {
             )
 
             ProtocolHandler.sendResponse(output, response)
-            Log.i(TAG, "Response sent to $peerIp")
+            LogManager.i(TAG, "Response sent to $peerIp")
 
         } catch (e: SecurityException) {
-            Log.e(TAG, "Security constraint violated: ${e.message}")
+            LogManager.e(TAG, "Security constraint violated: ${e.message}")
         } catch (e: java.net.SocketTimeoutException) {
-            Log.e(TAG, "Socket timeout during handshake", e)
+            LogManager.e(TAG, "Socket timeout during handshake", e)
         } catch (e: IOException) {
-            Log.e(TAG, "I/O error during handshake", e)
+            LogManager.e(TAG, "I/O error during handshake", e)
         } catch (e: Exception) {
-            Log.e(TAG, "Unexpected error during handshake", e)
+            LogManager.e(TAG, "Unexpected error during handshake", e)
         } finally {
             try { clientSocket.close() } catch (_: Exception) {}
         }
@@ -375,12 +376,12 @@ class PhonectNetworkService : Service() {
 
         wifiCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                Log.i(TAG, "Wi-Fi connected — listener ready")
+                LogManager.i(TAG, "Wi-Fi connected — listener ready")
                 broadcastStatus("wifi_connected")
             }
 
             override fun onLost(network: Network) {
-                Log.i(TAG, "Wi-Fi disconnected — pausing listener")
+                LogManager.i(TAG, "Wi-Fi disconnected — pausing listener")
                 broadcastStatus("wifi_disconnected")
             }
         }

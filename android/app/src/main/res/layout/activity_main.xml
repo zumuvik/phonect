@@ -73,4 +73,43 @@
         android:text="@string/btn_stop_service"
         android:enabled="false" />
 
+    <!-- Logs section -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/label_logs"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:layout_marginTop="24dp"
+        android:layout_marginBottom="4dp"
+        android:gravity="start"
+        android:layout_gravity="start" />
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:layout_marginBottom="8dp"
+        android:background="#1A000000"
+        android:padding="8dp">
+
+        <TextView
+            android:id="@+id/log_view"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textSize="10sp"
+            android:textColor="?android:attr/textColorPrimary"
+            android:lineSpacingExtra="2sp"
+            android:text=""
+            android:gravity="bottom" />
+
+    </ScrollView>
+
+    <Button
+        android:id="@+id/btn_share_logs"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/btn_share_logs" />
+
 </LinearLayout>

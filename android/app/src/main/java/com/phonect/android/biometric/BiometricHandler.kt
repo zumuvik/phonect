@@ -3,6 +3,7 @@ package com.phonect.android.biometric
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.fragment.app.FragmentActivity
+import com.phonect.android.logging.LogManager
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -28,15 +29,39 @@ class BiometricHandler(private val activity: FragmentActivity) {
      */
     fun canAuthenticate(): BiometricResult {
         val manager = BiometricManager.from(activity)
-        return when (manager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)) {
-            BiometricManager.BIOMETRIC_SUCCESS -> BiometricResult.AVAILABLE
-            BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE -> BiometricResult.NO_HARDWARE
-            BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE -> BiometricResult.HW_UNAVAILABLE
-            BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED -> BiometricResult.NOT_ENROLLED
-            BiometricManager.BIOMETRIC_ERROR_SECURITY_UPDATE_REQUIRED -> BiometricResult.SECURITY_UPDATE
-            BiometricManager.BIOMETRIC_ERROR_UNSUPPORTED -> BiometricResult.UNSUPPORTED
-            BiometricManager.BIOMETRIC_STATUS_UNKNOWN -> BiometricResult.UNKNOWN
-            else -> BiometricResult.UNKNOWN
+        return when (val result = manager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)) {
+            BiometricManager.BIOMETRIC_SUCCESS -> {
+                LogManager.d("BiometricHandler", "Biometric hardware available")
+                BiometricResult.AVAILABLE
+            }
+            BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE -> {
+                LogManager.w("BiometricHandler", "No biometric hardware")
+                BiometricResult.NO_HARDWARE
+            }
+            BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE -> {
+                LogManager.w("BiometricHandler", "Biometric hardware unavailable")
+                BiometricResult.HW_UNAVAILABLE
+            }
+            BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED -> {
+                LogManager.w("BiometricHandler", "No fingerprints enrolled")
+                BiometricResult.NOT_ENROLLED
+            }
+            BiometricManager.BIOMETRIC_ERROR_SECURITY_UPDATE_REQUIRED -> {
+                LogManager.w("BiometricHandler", "Biometric security update required")
+                BiometricResult.SECURITY_UPDATE
+            }
+            BiometricManager.BIOMETRIC_ERROR_UNSUPPORTED -> {
+                LogManager.w("BiometricHandler", "Biometric unsupported")
+                BiometricResult.UNSUPPORTED
+            }
+            BiometricManager.BIOMETRIC_STATUS_UNKNOWN -> {
+                LogManager.w("BiometricHandler", "Biometric status unknown: $result")
+                BiometricResult.UNKNOWN
+            }
+            else -> {
+                LogManager.w("BiometricHandler", "Biometric unknown result: $result")
+                BiometricResult.UNKNOWN
+            }
         }
     }
 
@@ -71,16 +96,19 @@ class BiometricHandler(private val activity: FragmentActivity) {
         val callback = object : BiometricPrompt.AuthenticationCallback() {
             override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
                 super.onAuthenticationSucceeded(result)
+                LogManager.i("BiometricHandler", "Biometric authentication succeeded")
                 onSuccess(result)
             }
 
             override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
                 super.onAuthenticationError(errorCode, errString)
+                LogManager.w("BiometricHandler", "Biometric error [$errorCode]: $errString")
                 onError(errorCode, errString.toString())
             }
 
             override fun onAuthenticationFailed() {
                 super.onAuthenticationFailed()
+                LogManager.w("BiometricHandler", "Biometric authentication failed (fingerprint not recognised)")
                 // Fingerprint not recognised — prompt stays open, do nothing.
             }
         }

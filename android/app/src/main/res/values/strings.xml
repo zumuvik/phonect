@@ -10,4 +10,6 @@
     <string name="status_listening">Listening on port %d</string>
     <string name="status_stopped">Service stopped</string>
     <string name="label_paired_pcs">Paired PCs</string>
+    <string name="label_logs">Logs</string>
+    <string name="btn_share_logs">Share Logs</string>
 </resources>

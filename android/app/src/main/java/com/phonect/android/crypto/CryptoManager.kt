@@ -2,7 +2,7 @@ package com.phonect.android.crypto
 
 import android.security.keystore.*
 import android.security.keystore.StrongBoxUnavailableException
-import android.util.Log
+import com.phonect.android.logging.LogManager
 import androidx.biometric.BiometricPrompt
 import java.security.*
 import java.security.spec.PSSParameterSpec
@@ -80,7 +80,7 @@ class CryptoManager(private val appContext: android.content.Context) {
             keyGen.generateKeyPair()
         } catch (e: StrongBoxUnavailableException) {
             if (preferStrongBox) {
-                Log.w(TAG, "StrongBox unavailable, falling back to TEE")
+                LogManager.w(TAG, "StrongBox unavailable, falling back to TEE")
                 generateKey(alias, preferStrongBox = false)
             } else {
                 throw e
@@ -243,7 +243,7 @@ class CryptoManager(private val appContext: android.content.Context) {
             verifier.update(nonce)
             verifier.verify(sigBytes)
         } catch (e: Exception) {
-            Log.e("CryptoManager", "PC signature verification failed", e)
+            LogManager.e("CryptoManager", "PC signature verification failed", e)
             false
         }
     }
