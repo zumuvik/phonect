@@ -1,14 +1,10 @@
 package com.phonect.android.network
 
 import android.app.*
+import android.bluetooth.*
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.content.SharedPreferences
-import android.net.ConnectivityManager
-import android.net.Network
-import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import android.os.Build
 import android.os.IBinder
 import androidx.biometric.BiometricPrompt
@@ -21,19 +17,16 @@ import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.*
 import java.io.*
-import java.net.*
-import java.nio.ByteBuffer
+import java.util.UUID
 
 /**
- * Foreground Service that listens for UDP discovery broadcasts from the PC.
+ * Foreground Service that listens for Bluetooth RFCOMM connections from the PC.
  *
- * - Listens on UDP port [UDP_DISCOVERY_PORT] (9875) for `PHONECT_DISCOVERY:` packets.
- * - On discovery, connects to the PC via TCP (port [PC_LISTEN_PORT]) and performs:
- *   1. **TOFU (Trust On First Use)**: sends `pair_hello` with the phone's public key,
- *      receives `pair_accept` with the PC's public key, saves PC in trusted list.
- *   2. **Challenge-response**: receives challenge, triggers biometric auth via
- *      **CryptoObject**, signs the nonce, sends response.
- * - Shows a persistent low-priority notification.
+ * - Advertises a Bluetooth server socket with a fixed UUID.
+ * - When the PC connects (after waking from sleep), performs TOFU
+ *   (Trust On First Use) and challenge-response authentication.
+ * - On successful signature, the unlock daemon on the PC side unlocks
+ *   the session — this service only provides the signed assertion.
  */
 class PhonectNetworkService : Service() {
 
@@ -43,6 +36,10 @@ class PhonectNetworkService : Service() {
         private const val NOTIFICATION_ID = 1
         private const val PREFS_NAME = "phonect_prefs"
         private const val PREFS_PAIRED_PCS = "paired_pcs"
+
+        /** Unique UUID for phonect Bluetooth RFCOMM service. */
+        private val SERVICE_UUID: UUID =
+            UUID.fromString("fa87c0d0-afac-11de-8a39-0800200c9a66")
 
         const val ACTION_START = "com.phonect.android.START"
         const val ACTION_STOP = "com.phonect.android.STOP"
@@ -65,8 +62,8 @@ class PhonectNetworkService : Service() {
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var listenJob: Job? = null
-    private var udpSocket: DatagramSocket? = null
-    private val connectingTo = mutableSetOf<String>()  // debounce: IPs we're already connecting to
+    private var bluetoothServerSocket: BluetoothServerSocket? = null
+    private var bluetoothAdapter: BluetoothAdapter? = null
 
     private lateinit var cryptoManager: CryptoManager
     private lateinit var prefs: SharedPreferences
@@ -83,23 +80,27 @@ class PhonectNetworkService : Service() {
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         createNotificationChannel()
 
+        bluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
+        if (bluetoothAdapter == null) {
+            LogManager.w(TAG, "Device does not support Bluetooth")
+        }
+
         serviceScope.launch {
             cryptoManager.generateKeyIfNeeded()
             LogManager.i(TAG, "Key generation completed")
         }
 
-        registerWifiCallback()
         LogManager.i(TAG, "Service created")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
-                val notification = buildNotification("Listening for PCs…", false)
+                val notification = buildNotification("Listening for PC via Bluetooth…", false)
                 startForeground(NOTIFICATION_ID, notification)
-                startDiscovery()
+                startBluetoothListener()
             }
-            ACTION_STOP -> stopDiscovery()
+            ACTION_STOP -> stopBluetoothListener()
         }
         return START_STICKY
     }
@@ -107,9 +108,8 @@ class PhonectNetworkService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        stopDiscovery()
+        stopBluetoothListener()
         serviceScope.cancel()
-        unregisterWifiCallback()
         super.onDestroy()
     }
 
@@ -131,102 +131,105 @@ class PhonectNetworkService : Service() {
     }
 
     /**
-     * Find a trusted PC by IP address.
+     * Find a trusted PC by its public key fingerprint.
      *
-     * Returns the matching [PairedPc] record, or `null` if the IP is unknown.
+     * Returns the matching [PairedPc] record, or `null` if unknown.
      * When no PCs are paired at all (first-time), returns null — caller
      * should proceed with TOFU.
      */
-    private fun findTrustedPeer(remoteAddress: InetAddress): PairedPc? {
+    private fun findTrustedPeerByFingerprint(fingerprint: String): PairedPc? {
         val trusted = getTrustedPcs()
         if (trusted.isEmpty()) return null
-        val rawIp = remoteAddress.hostAddress
-        return trusted.firstOrNull { pc -> pc.ipAddress == rawIp }
+        return trusted.firstOrNull { pc -> pc.publicKeyFingerprint == fingerprint }
     }
 
     // ------------------------------------------------------------------
-    // UDP discovery listener
+    // Bluetooth server listener
     // ------------------------------------------------------------------
 
-    private fun startDiscovery() {
+    private fun startBluetoothListener() {
         if (listenJob?.isActive == true) return
+        val adapter = bluetoothAdapter ?: return
 
         listenJob = serviceScope.launch {
             try {
-                udpSocket = DatagramSocket(UDP_DISCOVERY_PORT).apply {
-                    reuseAddress = true
-                    broadcast = true
-                    soTimeout = 5000  // 5s timeout for cancellation
-                }
-                LogManager.i(TAG, "UDP discovery listening on port $UDP_DISCOVERY_PORT")
-                updateNotification("Listening for PCs (UDP :$UDP_DISCOVERY_PORT)")
-                broadcastStatus("listening:udp:$UDP_DISCOVERY_PORT")
-
-                val buffer = ByteArray(512)
-                val packet = DatagramPacket(buffer, buffer.size)
+                // Use listenUsingRfcommWithServiceRecord for SDP registration
+                bluetoothServerSocket = adapter.listenUsingRfcommWithServiceRecord(
+                    "phonect",
+                    SERVICE_UUID,
+                )
+                LogManager.i(TAG, "Bluetooth RFCOMM listening on $SERVICE_UUID")
+                updateNotification("Listening for PC via Bluetooth")
+                broadcastStatus("listening:bt")
 
                 while (isActive) {
                     try {
-                        udpSocket?.receive(packet) ?: break
-                    } catch (e: SocketTimeoutException) {
-                        continue  // timeout is normal — re-loop for cancellation check
-                    }
+                        val socket = bluetoothServerSocket?.accept() ?: break
+                        val remoteDevice = socket.remoteDevice
+                        LogManager.i(
+                            TAG,
+                            "Bluetooth connection from ${remoteDevice.name} (${remoteDevice.address})",
+                        )
 
-                    val data = String(
-                        packet.data, packet.offset, packet.length, Charsets.UTF_8
-                    )
-                    val pcIp = packet.address.hostAddress ?: continue
-
-                    if (data.startsWith(DISCOVERY_PREFIX)) {
-                        val parts = data.removePrefix(DISCOVERY_PREFIX).split(":")
-                        val pcName = parts.getOrElse(0) { "PC" }
-                        LogManager.i(TAG, "Discovery from $pcIp: $pcName")
-
-                        // Connect to PC in a new coroutine (don't block UDP listener)
+                        // Handle connection in a new coroutine
                         launch {
-                            connectToPc(pcIp, PC_LISTEN_PORT, pcName)
+                            handleBtConnection(socket)
+                        }
+                    } catch (e: IOException) {
+                        if (isActive) {
+                            LogManager.e(TAG, "Bluetooth accept error", e)
                         }
                     }
                 }
-            } catch (e: Exception) {
-                LogManager.e(TAG, "UDP discovery error", e)
+            } catch (e: SecurityException) {
+                LogManager.e(TAG, "Bluetooth permission denied", e)
+                updateNotification("BT permission denied")
+                broadcastStatus("error:bt_permission")
+            } catch (e: IOException) {
+                LogManager.e(TAG, "Bluetooth server error", e)
                 updateNotification("Error: ${e.message ?: "unknown"}")
                 broadcastStatus("error")
             } finally {
-                try { udpSocket?.close() } catch (_: Exception) {}
-                LogManager.i(TAG, "UDP discovery stopped")
+                try { bluetoothServerSocket?.close() } catch (_: Exception) {}
+                LogManager.i(TAG, "Bluetooth listener stopped")
                 updateNotification("Service stopped")
                 broadcastStatus("stopped")
             }
         }
     }
 
-    private fun stopDiscovery() {
+    private fun stopBluetoothListener() {
         listenJob?.cancel()
-        try { udpSocket?.close() } catch (_: Exception) {}
-        udpSocket = null
+        try { bluetoothServerSocket?.close() } catch (_: Exception) {}
+        bluetoothServerSocket = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
     // ------------------------------------------------------------------
-    // TCP connection to PC
+    // Bluetooth connection handler
     // ------------------------------------------------------------------
 
-    private suspend fun connectToPc(pcIp: String, port: Int, pcName: String) {
-        // Debounce: skip if already connecting to this IP
-        if (!connectingTo.add(pcIp)) return
-        var socket: Socket? = null
+    private suspend fun handleBtConnection(socket: BluetoothSocket) {
+        var input: InputStream? = null
+        var output: OutputStream? = null
         try {
-            LogManager.i(TAG, "Connecting to $pcIp:$port ...")
+            input = socket.inputStream
+            output = socket.outputStream
 
-            socket = Socket()
-            socket.connect(InetSocketAddress(pcIp, port), 10_000)
+            // ── Step 1: Read pair_hello (PC sends first) ─────────────
+            val hello = ProtocolHandler.readPairHello(input)
+            if (hello == null) {
+                LogManager.w(TAG, "No PairHello from PC — aborting")
+                return
+            }
+            LogManager.i(TAG, "PairHello received from PC")
 
-            val input = socket.getInputStream()
-            val output = socket.getOutputStream()
+            val pcPem = hello.public_key_pem
+            val pcFp = hello.public_key_fingerprint
+            val pcName = hello.device_name
 
-            // ── Step 1: TOFU — send pair_hello ──────────────────────
+            // ── Step 2: Send pair_accept with phone's public key ──
             val pubKeyPem = cryptoManager.getPublicKeyPem()
             val pubKeyFp = cryptoManager.getPublicKeyFingerprint()
             if (pubKeyPem == null || pubKeyFp == null) {
@@ -234,35 +237,31 @@ class PhonectNetworkService : Service() {
                 return
             }
 
-            val hello = PairHelloMessage(
+            val accept = PairAcceptMessage(
+                session_id = hello.session_id,
                 public_key_pem = pubKeyPem,
                 public_key_fingerprint = pubKeyFp,
-                device_name = Build.MODEL,
             )
-            ProtocolHandler.sendPairHello(output, hello)
-            LogManager.i(TAG, "PairHello sent to $pcIp")
+            ProtocolHandler.sendPairAccept(output, accept)
+            LogManager.i(TAG, "PairAccept sent to PC")
 
-            // ── Step 2: Receive pair_accept ─────────────────────────
-            val accept = ProtocolHandler.readPairAccept(input)
-            if (accept == null) {
-                LogManager.w(TAG, "No PairAccept from $pcIp — aborting")
-                return
+            // ── Step 3: TOFU — save PC key if new ─────────────────
+            val trustedPc = findTrustedPeerByFingerprint(pcFp)
+            if (trustedPc == null) {
+                saveTrustedPc(
+                    name = pcName,
+                    publicKeyPem = pcPem,
+                    publicKeyFingerprint = pcFp,
+                )
+                LogManager.i(TAG, "TOFU: paired with PC $pcName (${pcFp.take(16)}…)")
+            } else {
+                LogManager.d(TAG, "PC already known: ${pcFp.take(16)}…")
             }
-            LogManager.i(TAG, "PairAccept received from $pcIp")
 
-            // Save PC in trusted list
-            saveTrustedPc(
-                name = pcName,
-                ipAddress = pcIp,
-                port = port,
-                publicKeyPem = accept.public_key_pem,
-                publicKeyFingerprint = accept.public_key_fingerprint,
-            )
-
-            // ── Step 3: Read challenge ──────────────────────────────
+            // ── Step 4: Read challenge ─────────────────────────────
             val challenge = ProtocolHandler.readChallenge(input)
             if (challenge == null) {
-                LogManager.w(TAG, "No challenge from $pcIp")
+                LogManager.w(TAG, "No challenge from PC")
                 return
             }
             LogManager.i(TAG, "Challenge received: session=${challenge.session_id}")
@@ -270,7 +269,7 @@ class PhonectNetworkService : Service() {
             val nonceBytes = try {
                 hexStringToByteArray(challenge.nonce)
             } catch (e: IllegalArgumentException) {
-                LogManager.e(TAG, "Invalid nonce hex from $pcIp")
+                LogManager.e(TAG, "Invalid nonce hex")
                 return
             }
             if (nonceBytes.size != 32) {
@@ -278,28 +277,28 @@ class PhonectNetworkService : Service() {
                 return
             }
 
-            // ── Step 4: Verify PC signature (mutual auth) ────────────
-            val trustedPc = findTrustedPeer(InetAddress.getByName(pcIp))
-            if (trustedPc != null &&
+            // ── Step 5: Verify PC signature (mutual auth) ────────────
+            val savedPc = findTrustedPeerByFingerprint(pcFp)
+            if (savedPc != null &&
                 challenge.pc_signature != null &&
                 challenge.pc_key_fingerprint != null
             ) {
                 val pcValid = cryptoManager.verifyPcSignature(
                     nonce = nonceBytes,
-                    signature = challenge.pc_signature,
-                    pcPublicKeyPem = trustedPc.publicKeyPem,
+                    signature = challenge.pc_signature!!,
+                    pcPublicKeyPem = savedPc.publicKeyPem,
                 )
                 if (!pcValid) {
-                    LogManager.w(TAG, "Mutual auth FAILED — PC signature invalid for $pcIp")
+                    LogManager.w(TAG, "Mutual auth FAILED — PC signature invalid for ${savedPc.name}")
                     return
                 }
                 LogManager.i(TAG, "Mutual auth OK — PC verified")
-            } else if (getTrustedPcs().isNotEmpty() && trustedPc == null) {
-                LogManager.w(TAG, "Untrusted PC $pcIp — no matching trusted record")
+            } else if (getTrustedPcs().isNotEmpty() && savedPc == null) {
+                LogManager.w(TAG, "Untrusted PC $pcFp — no matching trusted record")
                 return
             }
 
-            // ── Step 5: Biometric prompt ─────────────────────────────
+            // ── Step 6: Biometric prompt ─────────────────────────────
             val activity = getCurrentActivity() as? androidx.fragment.app.FragmentActivity
             if (activity == null) {
                 LogManager.w(TAG, "No Activity — cannot show biometric prompt")
@@ -309,7 +308,7 @@ class PhonectNetworkService : Service() {
             val signature = cryptoManager.getInitializedSignature()
             val cryptoObject = BiometricPrompt.CryptoObject(signature)
             val authResult = handler.awaitAuthentication(
-                title = "Unlock $pcName",
+                title = "Unlock ${savedPc?.name ?: pcName}",
                 subtitle = "Scan fingerprint to unlock your PC",
                 cryptoObject = cryptoObject,
             )
@@ -318,14 +317,14 @@ class PhonectNetworkService : Service() {
                 return
             }
 
-            // ── Step 6: Sign nonce ───────────────────────────────────
+            // ── Step 7: Sign nonce ───────────────────────────────────
             val validatedSignature = authResult.cryptoObject?.signature
                 ?: throw SecurityException("CryptoObject missing from biometric result")
             validatedSignature.update(nonceBytes)
             val signedBytes = validatedSignature.sign()
             LogManager.i(TAG, "Nonce signed: ${signedBytes.size} bytes")
 
-            // ── Step 7: Send response ────────────────────────────────
+            // ── Step 8: Send response ────────────────────────────────
             val response = ResponseMessage(
                 session_id = challenge.session_id,
                 signature = signedBytes.joinToString("") { "%02x".format(it) },
@@ -333,42 +332,41 @@ class PhonectNetworkService : Service() {
                 device_name = Build.MODEL,
             )
             ProtocolHandler.sendResponse(output, response)
-            LogManager.i(TAG, "Response sent to $pcIp")
+            LogManager.i(TAG, "Response sent to PC")
 
-        } catch (e: java.net.SocketTimeoutException) {
-            LogManager.e(TAG, "Socket timeout connecting to $pcIp", e)
-        } catch (e: IOException) {
-            LogManager.e(TAG, "I/O error with $pcIp", e)
+        } catch (e: java.io.IOException) {
+            LogManager.e(TAG, "I/O error during BT handshake", e)
         } catch (e: SecurityException) {
             LogManager.e(TAG, "Security constraint: ${e.message}")
         } catch (e: Exception) {
-            LogManager.e(TAG, "Unexpected error with $pcIp", e)
+            LogManager.e(TAG, "Unexpected error during BT handshake", e)
         } finally {
-            connectingTo.remove(pcIp)
-            try { socket?.close() } catch (_: Exception) {}
+            try {
+                input?.close()
+                output?.close()
+                socket.close()
+            } catch (_: Exception) {}
+            LogManager.i(TAG, "Bluetooth connection closed")
         }
     }
 
     // ------------------------------------------------------------------
-    // Trusted PC persistence
+    // Trusted PC persistence (keyed by fingerprint, no IP address)
     // ------------------------------------------------------------------
 
     private fun saveTrustedPc(
         name: String,
-        ipAddress: String,
-        port: Int,
         publicKeyPem: String,
         publicKeyFingerprint: String,
     ) {
         val current = getTrustedPcs().toMutableList()
 
-        // Update existing entry or add new
-        val idx = current.indexOfFirst { it.ipAddress == ipAddress }
+        val idx = current.indexOfFirst { it.publicKeyFingerprint == publicKeyFingerprint }
         val pc = PairedPc(
             name = name,
             hostname = name,
-            ipAddress = ipAddress,
-            port = port,
+            ipAddress = "",          // Not used — BT MAC replaces IP
+            port = 0,               // Not used
             publicKeyPem = publicKeyPem,
             publicKeyFingerprint = publicKeyFingerprint,
         )
@@ -378,39 +376,7 @@ class PhonectNetworkService : Service() {
             current.add(pc)
         }
         setTrustedPcs(current)
-        LogManager.i(TAG, "PC saved/updated: $name ($ipAddress)")
-    }
-
-    // ------------------------------------------------------------------
-    // Wi-Fi awareness
-    // ------------------------------------------------------------------
-
-    private var wifiCallback: ConnectivityManager.NetworkCallback? = null
-
-    private fun registerWifiCallback() {
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val request = NetworkRequest.Builder()
-            .addTransportType(android.net.NetworkCapabilities.TRANSPORT_WIFI)
-            .build()
-        wifiCallback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                LogManager.i(TAG, "Wi-Fi connected")
-                broadcastStatus("wifi_connected")
-            }
-            override fun onLost(network: Network) {
-                LogManager.w(TAG, "Wi-Fi disconnected")
-                broadcastStatus("wifi_disconnected")
-            }
-        }
-        cm.registerNetworkCallback(request, wifiCallback!!)
-    }
-
-    private fun unregisterWifiCallback() {
-        wifiCallback?.let {
-            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-            cm.unregisterNetworkCallback(it)
-        }
-        wifiCallback = null
+        LogManager.i(TAG, "PC saved/updated: $name ($publicKeyFingerprint)")
     }
 
     // ------------------------------------------------------------------

@@ -29,8 +29,8 @@ class TestConfig:
     def test_default_config_returns_minimal(self):
         """load_config() with no file returns defaults (no keys)."""
         cfg = load_config(Path("/nonexistent/config.toml"))
-        assert cfg.listen_port == 9876
-        assert cfg.listen_host == "0.0.0.0"
+        assert cfg.bluetooth_mac == ""
+        assert cfg.pc_name == ""
         assert cfg.has_pc_key is False
         assert cfg.has_trusted_key is False
 
@@ -44,9 +44,8 @@ class TestConfig:
             assert path.exists()
 
             cfg = load_config(path)
-            assert cfg.listen_port == 9876
-            assert cfg.poll_interval == 0.3  # 300ms converted to seconds
-            assert cfg.poll_timeout == 15.0
+            assert cfg.bluetooth_mac == ""
+            assert cfg.pc_name == "my-laptop"
             assert cfg.log_level == "INFO"
         finally:
             path.unlink(missing_ok=True)
@@ -65,21 +64,29 @@ class TestConfig:
 public_key = "{pub_key}"
 private_key = "{priv_key}"
 
-[daemon]
-listen_port = 9000
-poll_interval_ms = 300
-poll_timeout_seconds = 15
+[device]
+bluetooth_mac = "AA:BB:CC:DD:EE:FF"
+pc_name = "my-pc"
 unlock_on_start = true
 """)
             cfg = load_config(config_path)
-            assert cfg.listen_port == 9000
-            assert cfg.listen_host == "0.0.0.0"
-            assert cfg.poll_interval == 0.3
-            assert cfg.poll_timeout == 15.0
+            assert cfg.bluetooth_mac == "AA:BB:CC:DD:EE:FF"
+            assert cfg.pc_name == "my-pc"
             assert cfg.unlock_on_start is True
             assert cfg.has_pc_key is True
             assert cfg.has_trusted_key is True
             assert cfg.mutual_auth_ready is True
+
+    def test_invalid_mac_ignored(self):
+        """Config with invalid bluetooth_mac format gets empty string."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text("""\
+[device]
+bluetooth_mac = "not-a-mac"
+""")
+            cfg = load_config(config_path)
+            assert cfg.bluetooth_mac == ""  # invalid → default empty
 
     def test_config_invalid_no_key_file(self):
         """Config points to a missing public key file → has_trusted_key = False."""
@@ -183,7 +190,7 @@ class TestDaemonUnlockHook:
 
 
 # ======================================================================
-# Async: handshake via daemon's _async_handshake
+# Async: handshake via daemon's _async_handshake (legacy test helper)
 # ======================================================================
 
 class TestDaemonAsyncHandshake:
@@ -193,31 +200,11 @@ class TestDaemonAsyncHandshake:
     async def test_successful_async_handshake(self):
         """Mobile emulator connects to an in-process TCP server, daemon verifies."""
         mobile_kp = generate_key_pair()
-        pc_kp = generate_key_pair()  # not used directly
+        pc_kp = generate_key_pair()
 
-        # Config with mobile's public key (the phone's pubkey that PC trusts)
         cfg = DaemonConfig()
-        cfg.mobile_ip = "127.0.0.1"
-        cfg.mobile_port = 0
-        cfg._trusted_key_for_test = mobile_kp.public_key  # inject for test
-
         daemon = PhonectDaemon(cfg)
         daemon._trusted_key = mobile_kp.public_key  # trusted key = mobile's pubkey
-
-        # Start an in-process server that the daemon connects to
-        # (the daemon is normally the SERVER, but here we test _async_handshake
-        #  directly with the mobile emulator connecting to a local socket)
-
-        # Actually — the daemon plays the SERVER role. Let me create a test
-        # where we start a TCP listener (act as mobile), have the daemon
-        # connect as client via _async_handshake… wait, the daemon is the
-        # server. In _async_handshake, the daemon already has reader/writer
-        # from the mobile connection. So here we need the mobile to connect
-        # to the daemon's reader/writer.
-
-        # Better approach: start a simple asyncio server (daemon side),
-        # connect with mobile client, feed the daemon's _async_handshake
-        # the reader/writer pair.
 
         async def handle_mobile(reader, writer):
             """This will run the daemon's handshake logic."""
@@ -232,7 +219,6 @@ class TestDaemonAsyncHandshake:
             """Emulate the phone: connect, receive challenge, sign, respond."""
             reader, writer = await asyncio.open_connection(*addr)
             try:
-                # Read challenge
                 from phonect.protocol import decode_frame
                 buf = b""
                 while True:
@@ -250,7 +236,6 @@ class TestDaemonAsyncHandshake:
                 nonce = bytes.fromhex(msg["nonce"])
                 session_id = msg["session_id"]
 
-                # Sign & respond
                 from phonect.crypto import sign_nonce, fingerprint_from_public_key
                 signature = sign_nonce(mobile_kp.private_key, nonce)
                 fp = fingerprint_from_public_key(mobile_kp.public_key)
@@ -262,7 +247,6 @@ class TestDaemonAsyncHandshake:
             finally:
                 writer.close()
 
-        # Run both concurrently
         mobile_task = asyncio.create_task(mobile_client())
         await asyncio.wait_for(mobile_task, timeout=10)
 
@@ -273,7 +257,7 @@ class TestDaemonAsyncHandshake:
     async def test_async_handshake_wrong_key_rejected(self):
         """Mobile signs with wrong key → daemon rejects."""
         mobile_kp = generate_key_pair()
-        wrong_kp = generate_key_pair()  # different key pair
+        wrong_kp = generate_key_pair()
 
         cfg = DaemonConfig()
         daemon = PhonectDaemon(cfg)
@@ -305,7 +289,6 @@ class TestDaemonAsyncHandshake:
                 session_id = msg["session_id"]
 
                 from phonect.crypto import sign_nonce, fingerprint_from_public_key
-                # Sign WITH mobile's key (but PC trusts wrong_kp)
                 signature = sign_nonce(mobile_kp.private_key, nonce)
                 fp = fingerprint_from_public_key(mobile_kp.public_key)
 
@@ -321,11 +304,3 @@ class TestDaemonAsyncHandshake:
 
         server.close()
         await server.wait_closed()
-
-
-# ======================================================================
-# Config output
-# ======================================================================
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

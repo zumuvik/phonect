@@ -1,34 +1,34 @@
 """
-phonect.daemon — Asyncio-based daemon for P2P biometric unlock via UDP discovery + TOFU.
+phonect.daemon — Asyncio-based daemon for P2P biometric unlock via Bluetooth RFCOMM.
 
 Architecture
 ============
 
-Instead of connecting to a static phone IP, the daemon:
+The daemon connects to the Android phone via Bluetooth RFCOMM (PC = client).
 
-1. Listens on a TCP port (default 9876) for incoming phone connections.
-2. On resume-from-sleep (``PrepareForSleep`` D-Bus signal), sends UDP
-   discovery broadcasts on port 9875.
-3. A phone that hears the broadcast connects to the daemon over TCP.
-4. **Trust On First Use (TOFU)**: if the phone is unknown, both sides
-   exchange RSA public keys automatically — no manual config needed.
-5. After TOFU (or immediately for a known phone) the standard
-   challenge-response handshake runs; on success the daemon calls
-   ``loginctl unlock-session``.
+On resume-from-sleep (``PrepareForSleep`` D-Bus signal), the daemon:
+
+1. Opens a Bluetooth RFCOMM socket to the phone's MAC address.
+2. Sends a ``pair_hello`` message with the PC's RSA public key.
+3. Receives a ``pair_accept`` with the phone's public key (TOFU).
+4. Sends a challenge (nonce) — with mutual-auth signature if PC key loaded.
+5. Receives and verifies the phone's signed response.
+6. On success: calls ``loginctl unlock-session``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import socket
+import struct
 import subprocess
-import time
 from pathlib import Path
 from typing import Callable, List, Optional
 
-from phonect.config import DaemonConfig, load_config, UDP_DISCOVERY_PORT
+from phonect.config import DaemonConfig, load_config, BLUETOOTH_RFCOMM_CHANNEL
 from phonect.crypto import (
     generate_nonce,
     load_public_key,
@@ -43,12 +43,15 @@ from phonect.protocol import (
     MAX_FRAME_SIZE,
     encode_frame,
     make_challenge,
+    make_pair_hello,
     make_pair_accept,
     validate_response,
     validate_pair_hello,
+    validate_pair_accept,
     ProtocolError,
     ProtocolSecurityError,
     MSG_PAIR_HELLO,
+    MSG_PAIR_ACCEPT,
 )
 
 LOG = logging.getLogger("phonect.daemon")
@@ -62,8 +65,120 @@ DBUS_LOGIN1_OBJECT = "/org/freedesktop/login1"
 DBUS_LOGIN1_MANAGER = "org.freedesktop.login1.Manager"
 SIGNAL_PREPARE_FOR_SLEEP = "PrepareForSleep"
 
-HANDSHAKE_TIMEOUT = 10.0  # seconds waiting for phone I/O
-DISCOVERY_MSG_PREFIX = "PHONECT_DISCOVERY:"
+HANDSHAKE_TIMEOUT = 15.0  # seconds waiting for phone I/O
+BT_CONNECT_TIMEOUT = 10.0  # seconds for BT socket connect
+
+
+# ---------------------------------------------------------------------------
+# Async Bluetooth transport
+# ---------------------------------------------------------------------------
+
+
+class BluetoothTransport:
+    """
+    Async wrapper around a Bluetooth RFCOMM socket.
+
+    Provides frame-level read/write operations for the daemon's
+    asyncio event loop.
+    """
+
+    def __init__(self, mac: str, channel: int = BLUETOOTH_RFCOMM_CHANNEL):
+        self.mac = mac
+        self.channel = channel
+        self._sock: Optional[socket.socket] = None
+
+    async def connect(self) -> BluetoothTransport:
+        """
+        Create and connect the RFCOMM socket (non-blocking).
+        Raises ``OSError`` on failure (device off, unreachable, etc.).
+        """
+        self._sock = socket.socket(
+            socket.AF_BLUETOOTH,
+            socket.SOCK_STREAM,
+            socket.BTPROTO_RFCOMM,
+        )
+        self._sock.setblocking(False)
+        loop = asyncio.get_running_loop()
+        try:
+            await asyncio.wait_for(
+                loop.sock_connect(self._sock, (self.mac, self.channel)),
+                timeout=BT_CONNECT_TIMEOUT,
+            )
+        except (OSError, asyncio.TimeoutError):
+            self._sock.close()
+            self._sock = None
+            raise
+        LOG.info("Bluetooth RFCOMM connected to %s (ch %d)", self.mac, self.channel)
+        return self
+
+    async def _readexactly(self, n: int) -> bytes:
+        """Read exactly *n* bytes from the socket."""
+        if self._sock is None:
+            raise ConnectionError("Bluetooth socket not connected")
+        loop = asyncio.get_running_loop()
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = await loop.sock_recv(self._sock, n - len(buf))
+            if not chunk:
+                raise ConnectionError("Bluetooth connection closed by peer")
+            buf.extend(chunk)
+        return bytes(buf)
+
+    async def read_frame(self, timeout: float = HANDSHAKE_TIMEOUT) -> Optional[dict]:
+        """
+        Read one length-prefixed JSON frame from the Bluetooth socket.
+
+        Returns ``None`` on timeout or connection close.
+        Raises ``ProtocolSecurityError`` on invalid frame size.
+        """
+        try:
+            header = await asyncio.wait_for(
+                self._readexactly(4), timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            LOG.warning("Bluetooth read timed out (%.1fs)", timeout)
+            return None
+        except ConnectionError:
+            return None
+
+        payload_len = struct.unpack("!I", header)[0]
+
+        if payload_len <= 0 or payload_len > MAX_FRAME_SIZE:
+            raise ProtocolSecurityError(
+                f"Declared payload length {payload_len} exceeds maximum {MAX_FRAME_SIZE}"
+            )
+
+        try:
+            payload = await asyncio.wait_for(
+                self._readexactly(payload_len), timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            LOG.warning("Bluetooth payload read timed out")
+            return None
+        except ConnectionError:
+            return None
+
+        try:
+            return json.loads(payload.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ProtocolSecurityError(f"Invalid JSON payload: {exc}") from exc
+
+    async def write_frame(self, msg: dict) -> None:
+        """Encode and send a JSON frame over Bluetooth."""
+        if self._sock is None:
+            raise ConnectionError("Bluetooth socket not connected")
+        data = encode_frame(msg)
+        loop = asyncio.get_running_loop()
+        await loop.sock_sendall(self._sock, data)
+
+    def close(self) -> None:
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+            LOG.debug("Bluetooth socket closed")
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +188,7 @@ DISCOVERY_MSG_PREFIX = "PHONECT_DISCOVERY:"
 
 class PhonectDaemon:
     """
-    Async daemon for P2P biometric laptop unlock (UDP discovery + TOFU).
+    Async daemon for P2P biometric unlock (Bluetooth RFCOMM).
 
     Usage::
 
@@ -87,11 +202,7 @@ class PhonectDaemon:
         self._running = False
         self._wakeup_event = asyncio.Event()
 
-        # TCP server reference (set during run())
-        self._tcp_server: Optional[asyncio.AbstractServer] = None
-
-        # Auth-flow coordination: _handle_connection signals this
-        # event so that _on_wakeup knows when to proceed.
+        # Auth-flow coordination
         self._auth_completed = asyncio.Event()
         self._last_auth_ok = False
         self._auth_in_progress = False
@@ -128,44 +239,42 @@ class PhonectDaemon:
             except Exception as exc:
                 LOG.error("Failed to load trusted phone key: %s", exc)
 
-        LOG.info(
-            "PhonectDaemon initialised (listen=%s:%d, %s)",
-            config.listen_host, config.listen_port,
-            "mutual auth ready" if config.mutual_auth_ready
-            else "awaiting phone pairing" if config.has_pc_key
-            else "no PC key",
-        )
+        # ── Bluetooth config status ──────────────────────────────────
+        bt_ok = bool(config.bluetooth_mac)
+        if bt_ok:
+            LOG.info(
+                "PhonectDaemon initialised (BT %s, %s)",
+                config.bluetooth_mac,
+                "mutual auth ready" if config.mutual_auth_ready
+                else "awaiting phone pairing" if config.has_pc_key
+                else "no PC key",
+            )
+        else:
+            LOG.warning(
+                "No bluetooth_mac configured — set [device]bluetooth_mac in config"
+            )
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
-        """Main entry point.  Start TCP server, connect D-Bus, enter loop."""
+        """Main entry point.  Connect D-Bus, enter event loop."""
         LOG.info("Starting phonect daemon ...")
         self._running = True
 
-        # 1. Start TCP listener for phone connections
-        try:
-            self._tcp_server = await asyncio.start_server(
-                self._handle_connection,
-                host=self.config.listen_host,
-                port=self.config.listen_port,
-            )
-            addr = self._tcp_server.sockets[0].getsockname()
-            LOG.info("TCP listener on %s:%d", addr[0], addr[1])
-        except OSError as exc:
-            LOG.critical("Cannot start TCP listener: %s", exc)
-            return
-
-        # 2. Connect D-Bus (system bus)
+        # 1. Connect D-Bus (system bus)
         try:
             await self._connect_dbus()
         except Exception as exc:
             LOG.warning("D-Bus connection failed: %s (polling-only mode)", exc)
 
-        # 3. Optional initial unlock cycle
-        if self.config.unlock_on_start and self.config.has_pc_key:
+        # 2. Optional initial unlock cycle
+        if (
+            self.config.unlock_on_start
+            and self.config.has_pc_key
+            and self.config.bluetooth_mac
+        ):
             LOG.info("Performing initial unlock-on-start ...")
             asyncio.create_task(self._on_wakeup())
 
@@ -181,6 +290,10 @@ class PhonectDaemon:
 
                 if not self.config.has_pc_key:
                     LOG.warning("Cannot run auth — no PC private key")
+                    continue
+
+                if not self.config.bluetooth_mac:
+                    LOG.warning("Cannot run auth — no bluetooth_mac configured")
                     continue
 
                 if not self._auth_in_progress:
@@ -229,11 +342,7 @@ class PhonectDaemon:
         LOG.info("Subscribed to %s.%s", DBUS_LOGIN1_MANAGER, SIGNAL_PREPARE_FOR_SLEEP)
 
     async def _cleanup(self) -> None:
-        """Stop TCP server and disconnect D-Bus."""
-        if self._tcp_server is not None:
-            self._tcp_server.close()
-            await self._tcp_server.wait_closed()
-            LOG.debug("TCP server stopped")
+        """Clean up D-Bus connection."""
         if self._bus is not None:
             self._bus.disconnect()
             self._bus = None
@@ -261,7 +370,7 @@ class PhonectDaemon:
     # ------------------------------------------------------------------
 
     async def _on_wakeup(self) -> None:
-        """Handle wakeup: broadcast discovery, wait for phone auth."""
+        """Handle wakeup: connect via BT, run handshake, unlock if OK."""
         if self._auth_in_progress:
             LOG.debug("Auth already in progress, skipping")
             return
@@ -270,123 +379,84 @@ class PhonectDaemon:
         self._last_auth_ok = False
 
         try:
-            # Start UDP discovery broadcasts in the background
-            broadcast_task = asyncio.create_task(self._send_discovery_broadcasts())
+            ok = await self._bt_handshake()
 
-            # Wait for a phone to connect and complete auth
-            try:
-                await asyncio.wait_for(
-                    self._auth_completed.wait(),
-                    timeout=self.config.poll_timeout + 5.0,
-                )
-            except asyncio.TimeoutError:
-                LOG.warning("No phone responded during discovery window")
-            finally:
-                broadcast_task.cancel()
-                try:
-                    await broadcast_task
-                except asyncio.CancelledError:
-                    pass
-
-            if self._last_auth_ok:
+            if ok:
                 LOG.info("✓ Authentication successful — unlocking session(s)")
                 self._unlock_sessions()
             else:
                 LOG.warning("✗ Authentication failed or no phone connected")
         finally:
+            self._last_auth_ok = ok
+            self._auth_completed.set()
             self._auth_in_progress = False
 
-    async def _send_discovery_broadcasts(self) -> None:
-        """
-        Send UDP broadcast packets on port 9875 during the polling window.
-
-        Packet format: ``PHONECT_DISCOVERY:<pc_name>:<pc_fingerprint_prefix>``
-
-        The phone extracts the PC's IP from the UDP source address and
-        connects to our TCP listener.
-        """
-        if self._pc_private_key is None:
-            return
-
-        pc_name = self.config.pc_name or socket.gethostname()
-        fp = fingerprint_from_public_key(self._pc_private_key.public_key())
-        payload = f"{DISCOVERY_MSG_PREFIX}{pc_name}:{fp[:16]}"
-        data = payload.encode()
-
-        loop = asyncio.get_running_loop()
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.setblocking(False)
-
-        deadline = time.monotonic() + self.config.poll_timeout
-        count = 0
-        try:
-            while time.monotonic() < deadline and self._running:
-                try:
-                    await loop.sock_sendto(
-                        sock, data, ("255.255.255.255", UDP_DISCOVERY_PORT),
-                    )
-                    count += 1
-                except OSError:
-                    pass  # network not ready yet
-                await asyncio.sleep(self.config.poll_interval)
-        finally:
-            sock.close()
-            LOG.debug("Discovery: sent %d broadcasts in %.1fs", count, self.config.poll_timeout)
-
     # ------------------------------------------------------------------
-    # TCP connection handler
+    # Bluetooth handshake (PC → Phone)
     # ------------------------------------------------------------------
 
-    async def _handle_connection(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-    ) -> None:
+    async def _bt_handshake(self) -> bool:
         """
-        Handle an incoming phone TCP connection.
+        Full Bluetooth handshake as PC initiator.
 
-        1. Read the first frame — expects ``pair_hello`` with phone's PEM key.
-        2. TOFU: save phone key if unknown, send ``pair_accept`` with PC key.
-        3. Challenge-response handshake.
-        4. Signal the wakeup handler with the result.
+        Steps:
+        1. Connect to phone via RFCOMM.
+        2. Send ``pair_hello`` with PC's public key.
+        3. Receive ``pair_accept`` with phone's public key (TOFU).
+        4. Send challenge with mutual-auth signature.
+        5. Receive and verify signed response.
         """
-        peer = writer.get_extra_info("peername", ("?", 0))
-        LOG.info("Phone connected from %s:%d", peer[0], peer[1])
-
+        transport: Optional[BluetoothTransport] = None
         try:
-            # 1. Read first frame
-            msg = await self._read_frame(reader, timeout=HANDSHAKE_TIMEOUT)
-            if msg is None:
-                LOG.warning("Empty frame from phone — closing")
-                return
-
-            msg_type = msg.get("type")
-            LOG.debug("Received message type: %s", msg_type)
-
-            # Only pair_hello is expected as the first message
-            if msg_type != MSG_PAIR_HELLO:
-                LOG.warning("Unexpected first message type: %s", msg_type)
-                return
-
-            # 2. Validate pair_hello
+            # 1. Connect
+            transport = BluetoothTransport(self.config.bluetooth_mac)
             try:
-                hello = validate_pair_hello(msg)
+                await transport.connect()
+            except (OSError, asyncio.TimeoutError) as exc:
+                LOG.warning("Bluetooth connect failed: %s", exc)
+                return False
+
+            # 2. Send pair_hello
+            if self._pc_private_key is None:
+                LOG.error("No PC private key — cannot authenticate")
+                return False
+
+            pc_pem = public_key_to_pem(
+                self._pc_private_key.public_key()
+            ).decode()
+            pc_fp = fingerprint_from_public_key(self._pc_private_key.public_key())
+            hello = make_pair_hello(
+                public_key_pem=pc_pem,
+                public_key_fingerprint=pc_fp,
+                device_name=self.config.pc_name or socket.gethostname(),
+            )
+            await transport.write_frame(hello)
+            LOG.debug("PairHello sent (fp=%s)", pc_fp[:16])
+
+            # 3. Receive pair_accept
+            msg = await transport.read_frame(timeout=HANDSHAKE_TIMEOUT)
+            if msg is None:
+                LOG.warning("No response from phone — connection closed or timeout")
+                return False
+
+            try:
+                accept = validate_pair_accept(msg)
             except ProtocolError as exc:
-                LOG.warning("Invalid pair_hello: %s", exc)
-                return
+                LOG.warning("Invalid pair_accept: %s", exc)
+                return False
 
-            phone_pem = hello["public_key_pem"]
-            phone_fp = hello["public_key_fingerprint"]
-            device_name = hello.get("device_name", "phone")
+            phone_pem = accept["public_key_pem"]
+            phone_fp = accept["public_key_fingerprint"]
+            device_name = accept.get("device_name", "phone")
 
-            # 3. TOFU: save phone key if new
+            # TOFU: save phone key if new
             is_new = False
             if not self._is_known_key(phone_fp):
                 self._save_phone_key(phone_pem)
-                # Reload trusted key so _async_handshake can use it
                 try:
-                    self._trusted_key = load_public_key(self.config.trusted_key_pem)
+                    self._trusted_key = load_public_key(
+                        self.config.trusted_key_pem
+                    )
                     LOG.info(
                         "TOFU: paired with %s (%s …)",
                         device_name, phone_fp[:16],
@@ -394,53 +464,85 @@ class PhonectDaemon:
                     is_new = True
                 except Exception as exc:
                     LOG.error("TOFU: failed to reload phone key: %s", exc)
-                    return
+                    return False
             else:
                 LOG.debug("Phone already known: %s …", phone_fp[:16])
 
-            # 4. Send pair_accept with PC's public key
+            if self._trusted_key is None:
+                LOG.error("No trusted phone key — cannot verify response")
+                return False
+
+            # 4. Send challenge
+            nonce = generate_nonce()
+            pc_fp_mutual: Optional[str] = None
+            pc_sig: Optional[bytes] = None
             if self._pc_private_key is not None:
-                pc_pem = public_key_to_pem(self._pc_private_key.public_key()).decode()
-                pc_fp = fingerprint_from_public_key(self._pc_private_key.public_key())
-                accept = make_pair_accept(hello["session_id"], pc_pem, pc_fp)
-                writer.write(encode_frame(accept))
-                await writer.drain()
-            else:
-                LOG.warning("No PC private key — cannot send pair_accept")
-                return
+                pc_fp_mutual = fingerprint_from_public_key(
+                    self._pc_private_key.public_key()
+                )
+                pc_sig = sign_nonce(self._pc_private_key, nonce)
+                LOG.debug("Mutual-auth: challenge signed by PC key %s", pc_fp_mutual[:16])
 
-            # 5. Challenge-response
-            ok = await self._async_handshake(reader, writer)
-            self._last_auth_ok = ok
+            challenge = make_challenge(
+                nonce,
+                pc_key_fingerprint=pc_fp_mutual,
+                pc_signature=pc_sig,
+            )
+            await transport.write_frame(challenge)
+            LOG.debug("Sent challenge (session=%s)", challenge["session_id"])
 
-            if ok:
+            # 5. Receive response
+            try:
+                msg = await transport.read_frame(timeout=HANDSHAKE_TIMEOUT)
+            except ProtocolSecurityError as exc:
+                LOG.error("Security violation in response frame: %s", exc)
+                return False
+
+            if msg is None:
+                LOG.warning("Empty response / connection closed")
+                return False
+
+            try:
+                validated = validate_response(msg)
+            except ProtocolError as exc:
+                LOG.error("Invalid response schema: %s", exc)
+                return False
+
+            # 6. Verify signature (CPU-bound — run in executor)
+            signature = bytes.fromhex(validated["signature"])
+            loop = asyncio.get_running_loop()
+            valid = await loop.run_in_executor(
+                None, verify_nonce, self._trusted_key, nonce, signature,
+            )
+
+            if valid:
                 LOG.info(
                     "✓ Handshake SUCCESS — device=%s fp=%s%s",
-                    device_name, phone_fp[:16],
+                    validated.get("device_name", "?"),
+                    validated.get("public_key_fingerprint", "")[:16],
                     " (newly paired)" if is_new else "",
                 )
             else:
                 LOG.warning(
                     "✗ Handshake FAILED — device=%s fp=%s",
-                    device_name, phone_fp[:16],
+                    validated.get("device_name", "?"),
+                    validated.get("public_key_fingerprint", "")[:16],
                 )
 
-        except (asyncio.TimeoutError, ConnectionError) as exc:
-            LOG.warning("Connection error with %s: %s", peer[0], exc)
-            self._last_auth_ok = False
+            return valid
+
+        except (ConnectionError, OSError) as exc:
+            LOG.warning("Bluetooth connection error: %s", exc)
+            return False
         except ProtocolSecurityError as exc:
-            LOG.error("Security violation from %s: %s", peer[0], exc)
-            self._last_auth_ok = False
+            LOG.error("Security violation: %s", exc)
+            return False
         except Exception as exc:
-            LOG.exception("Unexpected error handling %s: %s", peer[0], exc)
-            self._last_auth_ok = False
+            LOG.exception("Unexpected error during BT handshake: %s", exc)
+            return False
         finally:
-            self._auth_completed.set()
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
+            if transport is not None:
+                transport.close()
 
     # ------------------------------------------------------------------
     # TOFU helpers
@@ -461,7 +563,7 @@ class PhonectDaemon:
         return our_fp == fingerprint
 
     # ------------------------------------------------------------------
-    # Challenge-response handshake
+    # Legacy async handshake (used by tests via reader/writer)
     # ------------------------------------------------------------------
 
     async def _async_handshake(
@@ -471,7 +573,8 @@ class PhonectDaemon:
     ) -> bool:
         """
         Perform the challenge-response handshake over an established TCP
-        connection (async version of ``HandshakeServer.accept_and_verify``).
+        connection.  Used by **tests only** — the BT handshake uses
+        ``_bt_handshake()`` instead.
 
         Returns ``True`` if the phone's response signature is valid.
         """
@@ -479,7 +582,6 @@ class PhonectDaemon:
             LOG.error("No trusted phone key loaded — cannot verify")
             return False
 
-        # 1. Send challenge (with mutual-auth fields if PC private key loaded)
         nonce = generate_nonce()
 
         pc_fp: Optional[str] = None
@@ -498,10 +600,8 @@ class PhonectDaemon:
         )
         writer.write(encode_frame(challenge))
         await writer.drain()
-
         LOG.debug("Sent challenge (session=%s)", challenge["session_id"])
 
-        # 2. Read response (length-prefixed frame)
         try:
             msg = await self._read_frame(reader, timeout=HANDSHAKE_TIMEOUT)
         except (asyncio.TimeoutError, ConnectionError) as exc:
@@ -515,14 +615,12 @@ class PhonectDaemon:
             LOG.warning("Empty response / connection closed")
             return False
 
-        # 3. Validate message structure
         try:
             validated = validate_response(msg)
         except ProtocolError as exc:
             LOG.error("Invalid response schema: %s", exc)
             return False
 
-        # 4. Verify signature (CPU-bound — run in executor)
         signature = bytes.fromhex(validated["signature"])
         loop = asyncio.get_running_loop()
         valid = await loop.run_in_executor(
@@ -549,32 +647,23 @@ class PhonectDaemon:
         timeout: float = 10.0,
     ) -> Optional[dict]:
         """
-        Read one length-prefixed JSON frame from the stream.
+        Read one length-prefixed JSON frame from a stream (test helper).
 
         Security
         --------
-        * Rejects frames whose declared payload exceeds ``MAX_FRAME_SIZE`` (64 KB)
-          to prevent memory exhaustion (DoS/OOM).  The caller must close the
-          connection after catching ``ProtocolSecurityError``.
+        * Rejects frames whose declared payload exceeds ``MAX_FRAME_SIZE`` (64 KB).
         """
-        import struct
-        import json
-
-        # Read 4-byte header
         header = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
         payload_len = struct.unpack("!I", header)[0]
 
-        # ── Security: enforce max frame size before allocating ──────────
         if payload_len <= 0 or payload_len > MAX_FRAME_SIZE:
             raise ProtocolSecurityError(
                 f"Declared payload length {payload_len} exceeds maximum {MAX_FRAME_SIZE}"
             )
 
-        # Read payload
         payload = await asyncio.wait_for(
             reader.readexactly(payload_len), timeout=timeout,
         )
-
         return json.loads(payload.decode("utf-8"))
 
     # ------------------------------------------------------------------
@@ -659,6 +748,11 @@ async def run_daemon(
         LOG.warning(
             "No PC private key configured. "
             "Run 'phonect gen-keys' then update config [keys]private_key."
+        )
+    if not config.bluetooth_mac:
+        LOG.warning(
+            "No bluetooth_mac configured. "
+            "Set [device]bluetooth_mac in config (e.g., \"AA:BB:CC:DD:EE:FF\")."
         )
 
     daemon = PhonectDaemon(config)

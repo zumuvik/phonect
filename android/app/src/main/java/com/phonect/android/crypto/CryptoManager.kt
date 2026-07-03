@@ -5,8 +5,7 @@ import android.security.keystore.StrongBoxUnavailableException
 import com.phonect.android.logging.LogManager
 import androidx.biometric.BiometricPrompt
 import java.security.*
-import java.security.spec.PSSParameterSpec
-import java.security.spec.X509EncodedKeySpec
+import java.security.spec.*
 import java.util.Base64
 
 /**
@@ -239,6 +238,16 @@ class CryptoManager(private val appContext: android.content.Context) {
             val pubKey = parsePemPublicKey(pcPublicKeyPem)
 
             val verifier = Signature.getInstance(SIGNATURE_ALGORITHM)
+            // Explicit PSS params: salt length = SHA-512 hash length (64 bytes)
+            // matching Python's cryptography library (salt_length=64 for interop).
+            val pssSpec = PSSParameterSpec(
+                "SHA-512",       // hash algorithm
+                "MGF1",           // mask generation function
+                MGF1ParameterSpec.SHA512,  // MGF1 hash
+                64,               // salt length = SHA-512 hash output bytes
+                1,                // trailer field (0xBC)
+            )
+            verifier.setParameter(pssSpec)
             verifier.initVerify(pubKey)
             verifier.update(nonce)
             verifier.verify(sigBytes)

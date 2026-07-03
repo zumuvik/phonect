@@ -87,6 +87,19 @@ object ProtocolHandler {
         outputStream.flush()
     }
 
+    fun readPairHello(inputStream: InputStream): PairHelloMessage? {
+        val msg = readFrame<PairHelloMessage>(inputStream) ?: return null
+        if (msg.type != MSG_PAIR_HELLO || msg.public_key_pem.isBlank()) {
+            return null
+        }
+        return msg
+    }
+
+    fun sendPairAccept(outputStream: OutputStream, accept: PairAcceptMessage) {
+        outputStream.write(encodeFrame(accept))
+        outputStream.flush()
+    }
+
     fun sendError(outputStream: OutputStream, sessionId: String, reason: String) {
         val error = ErrorMessage(session_id = sessionId, reason = reason)
         outputStream.write(encodeFrame(error))

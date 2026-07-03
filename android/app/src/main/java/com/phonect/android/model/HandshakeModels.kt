@@ -5,14 +5,12 @@ import android.os.Build
 /**
  * Wire-format messages — mirrors phonect.protocol on the Python side.
  *
- * Messages are JSON-encoded, length-prefixed frames over TCP.
+ * Messages are JSON-encoded, length-prefixed frames over Bluetooth RFCOMM.
  */
 
 const val PROTOCOL_VERSION = 1
 const val FRAME_HEADER_SIZE = 4   // uint32 big-endian
 const val MAX_FRAME_SIZE = 65_536 // 64 KB safety limit
-const val UDP_DISCOVERY_PORT = 9875
-const val PC_LISTEN_PORT = 9876
 
 // Message types (must match Python phonect.protocol)
 const val MSG_CHALLENGE = "challenge"
@@ -20,9 +18,6 @@ const val MSG_RESPONSE = "response"
 const val MSG_ERROR = "error"
 const val MSG_PAIR_HELLO = "pair_hello"
 const val MSG_PAIR_ACCEPT = "pair_accept"
-
-// Discovery packet prefix
-const val DISCOVERY_PREFIX = "PHONECT_DISCOVERY:"
 
 // ---------------------------------------------------------------------------
 // Kotlin data classes (serialised with Gson)
@@ -57,9 +52,9 @@ data class ErrorMessage(
 )
 
 /**
- * First message from phone to PC after TCP connect.
+ * First message from PC after Bluetooth RFCOMM connect.
  *
- * Carries the phone's RSA public key so the PC can store it
+ * Carries the PC's RSA public key so the phone can store it
  * (Trust On First Use).
  */
 data class PairHelloMessage(
@@ -68,13 +63,13 @@ data class PairHelloMessage(
     val session_id: String = "",
     val public_key_pem: String = "",
     val public_key_fingerprint: String = "",
-    val device_name: String = Build.MODEL,
+    val device_name: String = "",
 )
 
 /**
- * PC's response to [PairHelloMessage].
+ * Phone's response to [PairHelloMessage].
  *
- * Carries the PC's RSA public key so the phone can store it.
+ * Carries the phone's RSA public key so the PC can store it.
  */
 data class PairAcceptMessage(
     val version: Int = PROTOCOL_VERSION,
@@ -88,8 +83,8 @@ data class PairAcceptMessage(
 data class PairedPc(
     val name: String,
     val hostname: String,
-    val ipAddress: String,
-    val port: Int = PC_LISTEN_PORT,
+    val ipAddress: String = "",          // Not used with Bluetooth
+    val port: Int = 0,                   // Not used with Bluetooth
     val publicKeyPem: String,
     val publicKeyFingerprint: String,
 )

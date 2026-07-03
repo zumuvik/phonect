@@ -25,7 +25,7 @@ RSA_KEY_SIZE = 4096
 SIGNATURE_HASH = hashes.SHA512()
 SIGNATURE_PADDING = padding.PSS(
     mgf=padding.MGF1(SIGNATURE_HASH),
-    salt_length=padding.PSS.MAX_LENGTH,
+    salt_length=padding.PSS.DIGEST_LENGTH,  # = hash output (64 bytes for SHA-512)
 )
 
 PUBLIC_KEY_FINGERPRINT_HASH = hashes.SHA256()
