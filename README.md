@@ -52,7 +52,7 @@ phonect/
 ├── android/                # 📱 Android-приложение (Kotlin)
 │   └── app/src/main/java/com/phonect/android/
 │       ├── crypto/CryptoManager.kt      # RSA-4096 в Android Keystore + биометрия
-│       ├── network/PhonectNetworkService.kt  # Foreground Service TCP listener
+│       ├── network/PhonectNetworkService.kt  # UDP discovery + TCP client service
 │       ├── network/ProtocolHandler.kt   # Парсинг фреймов (64KB limit)
 │       ├── biometric/BiometricHandler.kt     # BiometricPrompt wrapper
 │       ├── model/HandshakeModels.kt     # Data-классы сообщений
@@ -111,7 +111,7 @@ python scripts/e2e_cli_test.py
 - [x] **Шаг 2**: Фоновый демон для Linux с интеграцией `systemd-logind` и `suspend.target` — **готов**
 - [x] **Шаг 3**: Android-приложение (Keystore, BiometricPrompt, Foreground Service) — **готов**
   - `CryptoManager.kt` — RSA-4096 в Android Keystore с BIOMETRIC_STRONG
-  - `PhonectNetworkService.kt` — Foreground Service, TCP listener, Wi-Fi awareness
+  - `PhonectNetworkService.kt` — Foreground Service, UDP discovery + TCP connection, Wi-Fi awareness
   - `BiometricHandler.kt` — BiometricPrompt интеграция
   - `ProtocolHandler.kt` — парсинг фреймов phonect.protocol
 - [ ] **Шаг 4**: TUI-конфигуратор с QR-кодом и менеджером устройств
@@ -136,10 +136,12 @@ python scripts/e2e_cli_test.py
 
   services.phonect = {
     enable = true;
-    user = "zumuvik";
-    mobileIp = "192.168.1.100";
-    mobilePort = 9876;
-    publicKey = "/var/lib/phonect/trusted_device.pub";
+    settings = {
+      keys.public_key = "/home/user/.config/phonect/trusted_device.pub";
+      keys.private_key = "/home/user/.config/phonect/pc_private.pem";
+      daemon.listen_host = "0.0.0.0";
+      daemon.listen_port = 9876;
+    };
   };
 }
 ```
@@ -147,6 +149,7 @@ python scripts/e2e_cli_test.py
 Модуль автоматизирует:
 - Сборку Python-пакета с зависимостями (`cryptography`, `dbus-next`)
 - Генерацию config.toml из опций
+- Открытие TCP-порта демона и UDP discovery-порта 9875 в firewall
 - Systemd-сервис с security hardening
 - Запуск сервиса после `network.target` и `suspend.target`
 

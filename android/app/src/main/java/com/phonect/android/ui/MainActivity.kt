@@ -1,19 +1,15 @@
 package com.phonect.android.ui
 
-import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.phonect.android.R
 import com.phonect.android.biometric.BiometricHandler
@@ -33,15 +29,6 @@ import com.phonect.android.network.PhonectNetworkService
  * - Real-time log display and share
  */
 class MainActivity : AppCompatActivity() {
-
-    companion object {
-        private const val RC_BLUETOOTH_PERM = 1001
-        private val REQUIRED_BT_PERMS = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE)
-        } else {
-            emptyArray()
-        }
-    }
 
     private lateinit var cryptoManager: CryptoManager
     private lateinit var biometricHandler: BiometricHandler
@@ -137,17 +124,6 @@ class MainActivity : AppCompatActivity() {
     // ------------------------------------------------------------------
 
     private fun startService() {
-        // Request Bluetooth runtime permissions on Android 12+
-        for (perm in REQUIRED_BT_PERMS) {
-            if (ContextCompat.checkSelfPermission(this, perm) != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(this, REQUIRED_BT_PERMS, RC_BLUETOOTH_PERM)
-                return  // onRequestPermissionsResult will call startService again
-            }
-        }
-        doStartService()
-    }
-
-    private fun doStartService() {
         val intent = Intent(this, PhonectNetworkService::class.java).apply {
             action = PhonectNetworkService.ACTION_START
         }
@@ -160,23 +136,6 @@ class MainActivity : AppCompatActivity() {
         updateStatus("starting")
         startButton.isEnabled = false
         stopButton.isEnabled = true
-    }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray,
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == RC_BLUETOOTH_PERM) {
-            val allGranted = grantResults.all { it == PackageManager.PERMISSION_GRANTED }
-            if (allGranted) {
-                doStartService()
-            } else {
-                Toast.makeText(this, "Bluetooth permission required for BT mode", Toast.LENGTH_LONG).show()
-                updateStatus("bt_perm_denied")
-            }
-        }
     }
 
     private fun stopService() {

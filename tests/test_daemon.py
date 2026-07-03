@@ -16,9 +16,10 @@ from typing import List, Optional
 import pytest
 
 from phonect.config import DaemonConfig, load_config, write_default_config
-from phonect.crypto import generate_key_pair
+from phonect.crypto import generate_key_pair, fingerprint_from_public_key, public_key_to_pem, sign_nonce
 from phonect.daemon import PhonectDaemon
 from phonect.handshake import HandshakeClient
+from phonect.protocol import encode_frame, make_pair_hello, make_response, validate_pair_accept
 
 
 # ======================================================================
@@ -29,7 +30,6 @@ class TestConfig:
     def test_default_config_returns_minimal(self):
         """load_config() with no file returns defaults (no keys)."""
         cfg = load_config(Path("/nonexistent/config.toml"))
-        assert cfg.bluetooth_mac == ""
         assert cfg.pc_name == ""
         assert cfg.has_pc_key is False
         assert cfg.has_trusted_key is False
@@ -44,8 +44,11 @@ class TestConfig:
             assert path.exists()
 
             cfg = load_config(path)
-            assert cfg.bluetooth_mac == ""
             assert cfg.pc_name == "my-laptop"
+            assert cfg.listen_host == "0.0.0.0"
+            assert cfg.listen_port == 9876
+            assert cfg.poll_interval == 0.3
+            assert cfg.poll_timeout == 15.0
             assert cfg.log_level == "INFO"
         finally:
             path.unlink(missing_ok=True)
@@ -65,28 +68,25 @@ public_key = "{pub_key}"
 private_key = "{priv_key}"
 
 [device]
-bluetooth_mac = "AA:BB:CC:DD:EE:FF"
 pc_name = "my-pc"
 unlock_on_start = true
+
+[daemon]
+listen_host = "127.0.0.1"
+listen_port = 12345
+poll_interval = 1.5
+poll_timeout = 0.5
 """)
             cfg = load_config(config_path)
-            assert cfg.bluetooth_mac == "AA:BB:CC:DD:EE:FF"
             assert cfg.pc_name == "my-pc"
             assert cfg.unlock_on_start is True
+            assert cfg.listen_host == "127.0.0.1"
+            assert cfg.listen_port == 12345
+            assert cfg.poll_interval == 1.5
+            assert cfg.poll_timeout == 0.5
             assert cfg.has_pc_key is True
             assert cfg.has_trusted_key is True
             assert cfg.mutual_auth_ready is True
-
-    def test_invalid_mac_ignored(self):
-        """Config with invalid bluetooth_mac format gets empty string."""
-        with tempfile.TemporaryDirectory() as tmp:
-            config_path = Path(tmp) / "config.toml"
-            config_path.write_text("""\
-[device]
-bluetooth_mac = "not-a-mac"
-""")
-            cfg = load_config(config_path)
-            assert cfg.bluetooth_mac == ""  # invalid → default empty
 
     def test_config_invalid_no_key_file(self):
         """Config points to a missing public key file → has_trusted_key = False."""
@@ -252,6 +252,163 @@ class TestDaemonAsyncHandshake:
 
         server.close()
         await server.wait_closed()
+
+
+class TestDaemonTcpPairing:
+    async def _phone(self, host, port, kp, device_name="phone"):
+        reader, writer = await asyncio.open_connection(host, port)
+        fp = fingerprint_from_public_key(kp.public_key)
+        hello = make_pair_hello(public_key_to_pem(kp.public_key).decode(), fp, device_name)
+        writer.write(encode_frame(hello)); await writer.drain()
+        accept = validate_pair_accept(await PhonectDaemon._read_frame(reader))
+        challenge = await PhonectDaemon._read_frame(reader)
+        signature = sign_nonce(kp.private_key, bytes.fromhex(challenge["nonce"]))
+        writer.write(encode_frame(make_response(challenge["session_id"], signature, fp, device_name)))
+        await writer.drain()
+        writer.close(); await writer.wait_closed()
+        return accept
+
+    @pytest.mark.asyncio
+    async def test_full_tcp_pairing_then_unlock_only_on_pinned_key(self, monkeypatch):
+        mobile_kp = generate_key_pair(); pc_kp = generate_key_pair()
+        with tempfile.TemporaryDirectory() as tmp:
+            trusted = Path(tmp) / "trusted_device.pub"
+            priv = Path(tmp) / "pc_private.pem"; priv.write_bytes(pc_kp.private_key_pem)
+            cfg = DaemonConfig(private_key_path=priv, public_key_path=trusted, listen_host="127.0.0.1", listen_port=0)
+            daemon = PhonectDaemon(cfg)
+            daemon._auth_pending = True
+            unlocks = []
+            monkeypatch.setattr(daemon, "_get_active_session_ids", lambda: ["2"])
+            daemon._unlock_hook = lambda cmd: unlocks.append(cmd)
+            server = await asyncio.start_server(daemon._handle_client, "127.0.0.1", 0)
+            host, port = server.sockets[0].getsockname()
+            try:
+                await self._phone(host, port, mobile_kp)
+                assert trusted.read_bytes() == mobile_kp.public_key_pem
+                assert unlocks == []
+                daemon._auth_pending = True
+                await self._phone(host, port, mobile_kp)
+                assert len(unlocks) == 1
+            finally:
+                server.close(); await server.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_mismatched_pair_hello_rejected_without_overwrite(self):
+        trusted_kp = generate_key_pair(); evil_kp = generate_key_pair(); pc_kp = generate_key_pair()
+        with tempfile.TemporaryDirectory() as tmp:
+            trusted = Path(tmp) / "trusted_device.pub"; trusted.write_bytes(trusted_kp.public_key_pem)
+            original = trusted.read_bytes()
+            priv = Path(tmp) / "pc_private.pem"; priv.write_bytes(pc_kp.private_key_pem)
+            cfg = DaemonConfig(private_key_path=priv, public_key_path=trusted)
+            daemon = PhonectDaemon(cfg)
+            daemon._auth_pending = True
+            async def handler(reader, writer):
+                await daemon._handle_client(reader, writer)
+            server = await asyncio.start_server(handler, "127.0.0.1", 0)
+            host, port = server.sockets[0].getsockname()
+            try:
+                reader, writer = await asyncio.open_connection(host, port)
+                fp = fingerprint_from_public_key(evil_kp.public_key)
+                writer.write(encode_frame(make_pair_hello(public_key_to_pem(evil_kp.public_key).decode(), fp, "evil")))
+                await writer.drain()
+                with pytest.raises((asyncio.IncompleteReadError, ConnectionResetError, TimeoutError)):
+                    await PhonectDaemon._read_frame(reader, timeout=1)
+                writer.close(); await writer.wait_closed()
+                assert trusted.read_bytes() == original
+            finally:
+                server.close(); await server.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_tcp_connection_outside_auth_window_closed_without_unlock(self, monkeypatch):
+        mobile_kp = generate_key_pair(); pc_kp = generate_key_pair()
+        with tempfile.TemporaryDirectory() as tmp:
+            trusted = Path(tmp) / "trusted_device.pub"; trusted.write_bytes(mobile_kp.public_key_pem)
+            priv = Path(tmp) / "pc_private.pem"; priv.write_bytes(pc_kp.private_key_pem)
+            cfg = DaemonConfig(private_key_path=priv, public_key_path=trusted)
+            daemon = PhonectDaemon(cfg)
+            unlocks = []
+            daemon._unlock_hook = lambda cmd: unlocks.append(cmd)
+            server = await asyncio.start_server(daemon._handle_client, "127.0.0.1", 0)
+            host, port = server.sockets[0].getsockname()
+            try:
+                reader, writer = await asyncio.open_connection(host, port)
+                fp = fingerprint_from_public_key(mobile_kp.public_key)
+                writer.write(encode_frame(make_pair_hello(public_key_to_pem(mobile_kp.public_key).decode(), fp, "phone")))
+                await writer.drain()
+                with pytest.raises((asyncio.IncompleteReadError, ConnectionResetError, TimeoutError)):
+                    await PhonectDaemon._read_frame(reader, timeout=1)
+                writer.close(); await writer.wait_closed()
+                assert unlocks == []
+            finally:
+                server.close(); await server.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_first_tofu_fingerprint_mismatch_not_persisted(self):
+        mobile_kp = generate_key_pair(); other_kp = generate_key_pair(); pc_kp = generate_key_pair()
+        with tempfile.TemporaryDirectory() as tmp:
+            trusted = Path(tmp) / "trusted_device.pub"
+            priv = Path(tmp) / "pc_private.pem"; priv.write_bytes(pc_kp.private_key_pem)
+            cfg = DaemonConfig(private_key_path=priv, public_key_path=trusted)
+            daemon = PhonectDaemon(cfg)
+            daemon._auth_pending = True
+            server = await asyncio.start_server(daemon._handle_client, "127.0.0.1", 0)
+            host, port = server.sockets[0].getsockname()
+            try:
+                reader, writer = await asyncio.open_connection(host, port)
+                wrong_fp = fingerprint_from_public_key(other_kp.public_key)
+                writer.write(encode_frame(make_pair_hello(public_key_to_pem(mobile_kp.public_key).decode(), wrong_fp, "phone")))
+                await writer.drain()
+                with pytest.raises((asyncio.IncompleteReadError, ConnectionResetError, TimeoutError)):
+                    await PhonectDaemon._read_frame(reader, timeout=1)
+                writer.close(); await writer.wait_closed()
+                assert not trusted.exists()
+            finally:
+                server.close(); await server.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_abandoned_first_tofu_not_persisted(self):
+        mobile_kp = generate_key_pair(); pc_kp = generate_key_pair()
+        with tempfile.TemporaryDirectory() as tmp:
+            trusted = Path(tmp) / "trusted_device.pub"
+            priv = Path(tmp) / "pc_private.pem"; priv.write_bytes(pc_kp.private_key_pem)
+            cfg = DaemonConfig(private_key_path=priv, public_key_path=trusted)
+            daemon = PhonectDaemon(cfg)
+            daemon._auth_pending = True
+            server = await asyncio.start_server(daemon._handle_client, "127.0.0.1", 0)
+            host, port = server.sockets[0].getsockname()
+            try:
+                reader, writer = await asyncio.open_connection(host, port)
+                fp = fingerprint_from_public_key(mobile_kp.public_key)
+                writer.write(encode_frame(make_pair_hello(public_key_to_pem(mobile_kp.public_key).decode(), fp, "phone")))
+                await writer.drain()
+                await PhonectDaemon._read_frame(reader)
+                await PhonectDaemon._read_frame(reader)
+                writer.close(); await writer.wait_closed()
+                await asyncio.wait_for(daemon._auth_completed.wait(), timeout=2)
+                assert not trusted.exists()
+            finally:
+                server.close(); await server.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_listen_port_zero_records_actual_bound_port(self):
+        pc_kp = generate_key_pair()
+        with tempfile.TemporaryDirectory() as tmp:
+            priv = Path(tmp) / "pc_private.pem"; priv.write_bytes(pc_kp.private_key_pem)
+            cfg = DaemonConfig(private_key_path=priv, listen_host="127.0.0.1", listen_port=0, poll_timeout=0.05)
+            daemon = PhonectDaemon(cfg)
+            async def no_dbus():
+                return None
+            daemon._connect_dbus = no_dbus
+            task = asyncio.create_task(daemon.run())
+            try:
+                for _ in range(50):
+                    if daemon._actual_listen_port != 0:
+                        break
+                    await asyncio.sleep(0.01)
+                assert daemon._actual_listen_port > 0
+            finally:
+                daemon.stop()
+                await asyncio.wait_for(task, timeout=2)
 
     @pytest.mark.asyncio
     async def test_async_handshake_wrong_key_rejected(self):

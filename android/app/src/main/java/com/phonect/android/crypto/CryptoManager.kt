@@ -161,6 +161,18 @@ class CryptoManager(private val appContext: android.content.Context) {
         return hash.toHex()
     }
 
+    /** Compute SHA-256 fingerprint (hex) for an arbitrary PEM public key. */
+    fun fingerprintPublicKeyPem(pem: String): String? {
+        return try {
+            val pubKey = parsePemPublicKey(pem)
+            val digest = MessageDigest.getInstance("SHA-256")
+            digest.digest(pubKey.encoded).toHex()
+        } catch (e: Exception) {
+            LogManager.e(TAG, "Public key fingerprint calculation failed", e)
+            null
+        }
+    }
+
     /**
      * Check whether the key exists in the Keystore.
      */

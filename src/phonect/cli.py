@@ -17,6 +17,9 @@ Usage::
 
     # Initialise a config template
     phonect init-config [--path <path>]
+
+    # Pairing happens over Wi-Fi/TCP on first phone connection (TOFU)
+    phonect pair [--config <path>]
 """
 
 from __future__ import annotations
@@ -122,8 +125,13 @@ def cmd_init_config(args: argparse.Namespace) -> None:
     target = Path(args.path) if args.path else None
     written = write_default_config(target)
     print(f"✓ Config template written to: {written}")
-    print(f"  Edit it to set your mobile IP and public key path, then run:")
-    print(f"    phonect daemon")
+    print(f"  Then run 'phonect daemon' and connect from your phone on Wi-Fi/TCP.")
+
+
+def cmd_pair(args: argparse.Namespace) -> None:
+    """Manual pairing command was removed; Wi-Fi/TCP uses daemon-side TOFU."""
+    print("Manual pairing is disabled. Start 'phonect daemon' and connect from the phone on Wi-Fi/TCP.")
+    print("The first valid phone key will be pinned, but that first connection will not unlock.")
 
 
 def cmd_tui(_args: argparse.Namespace) -> None:
@@ -172,6 +180,11 @@ def main() -> None:
     ic = sub.add_parser("init-config", help="Write a default config.toml template")
     ic.add_argument("--path", help="Output path (default: ~/.config/phonect/config.toml)")
     ic.set_defaults(func=cmd_init_config)
+
+    # pair
+    pr = sub.add_parser("pair", help="Deprecated: Wi-Fi/TCP pairs on first daemon connection")
+    pr.add_argument("--config", help="Path to config.toml (default: ~/.config/phonect/config.toml)")
+    pr.set_defaults(func=cmd_pair)
 
     # tui
     tui_p = sub.add_parser("tui", help="Launch the Textual TUI (pairing, status, logs)")

@@ -4,8 +4,8 @@ phonect.config — Configuration file management for the daemon.
 Config location:  ``$XDG_CONFIG_HOME/phonect/config.toml``
 Defaults:         ``~/.config/phonect/config.toml``
 
-The daemon uses Bluetooth RFCOMM to connect to the phone directly,
-bypassing Wi-Fi AP isolation issues.
+The daemon listens for TCP connections from the phone and advertises itself
+with UDP discovery broadcasts.
 
 Example config::
 
@@ -13,16 +13,12 @@ Example config::
     private_key = "/home/user/.config/phonect/pc_private.pem"
     public_key = "/home/user/.config/phonect/trusted_device.pub"
 
-    [device]
-    bluetooth_mac = "AA:BB:CC:DD:EE:FF"
-
     [logging]
     level = "INFO"
 """
 
 from __future__ import annotations
 
-import re
 import tomllib
 import os
 from dataclasses import dataclass, field
@@ -37,15 +33,7 @@ CONFIG_DIR_NAME = "phonect"
 CONFIG_FILE_NAME = "config.toml"
 DEFAULT_PC_KEY_BASENAME = "pc_private"
 
-# Bluetooth RFCOMM channel used for phonect
-BLUETOOTH_RFCOMM_CHANNEL = 1
-
-# UUID used by the Android BT server for phonect connections
-SERVICE_UUID = "fa87c0d0-afac-11de-8a39-0800200c9a66"
-
-# Regex for MAC address validation
-_MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
-
+UDP_DISCOVERY_PORT = 9875
 
 # ---------------------------------------------------------------------------
 # Config data class
@@ -63,11 +51,12 @@ class DaemonConfig:
     private_key_path: Path = field(default_factory=lambda: Path("/nonexistent"))
     public_key_path: Path = field(default_factory=lambda: Path("/nonexistent"))
 
-    # Bluetooth device address (phone)
-    bluetooth_mac: str = field(default="")
-
     # Behaviour
     unlock_on_start: bool = field(default=False)
+    listen_host: str = field(default="0.0.0.0")
+    listen_port: int = field(default=9876)
+    poll_interval: float = field(default=0.3)
+    poll_timeout: float = field(default=15.0)
 
     # Logging
     log_level: str = field(default="INFO")
@@ -124,11 +113,6 @@ def default_config_path() -> Path:
 # ---------------------------------------------------------------------------
 
 
-def validate_mac(mac: str) -> bool:
-    """Check if *mac* is a valid ``XX:XX:XX:XX:XX:XX`` address."""
-    return bool(_MAC_RE.match(mac))
-
-
 def load_config(path: Optional[Path] = None) -> DaemonConfig:
     """
     Load and parse a ``phonect`` TOML config file.
@@ -140,7 +124,12 @@ def load_config(path: Optional[Path] = None) -> DaemonConfig:
     cfg_path = path or default_config_path()
 
     if not cfg_path.exists():
-        return DaemonConfig()
+        cfg_dir = cfg_path.parent
+        return DaemonConfig(
+            config_dir=cfg_dir,
+            private_key_path=cfg_dir / f"{DEFAULT_PC_KEY_BASENAME}.pem",
+            public_key_path=cfg_dir / "trusted_device.pub",
+        )
 
     raw = cfg_path.read_bytes()
     data = tomllib.loads(raw.decode("utf-8"))
@@ -154,26 +143,27 @@ def load_config(path: Optional[Path] = None) -> DaemonConfig:
     if pk:
         base.public_key_path = Path(pk).expanduser()
     else:
-        fallback = cfg_path.parent / "trusted_device.pub"
-        if fallback.exists():
-            base.public_key_path = fallback
+        base.public_key_path = cfg_path.parent / "trusted_device.pub"
 
     privk = keys.get("private_key", "")
     if privk:
         base.private_key_path = Path(privk).expanduser()
     else:
-        fallback_priv = cfg_path.parent / f"{DEFAULT_PC_KEY_BASENAME}.pem"
-        if fallback_priv.exists():
-            base.private_key_path = fallback_priv
+        base.private_key_path = cfg_path.parent / f"{DEFAULT_PC_KEY_BASENAME}.pem"
 
     # ── [device] ──────────────────────────────────────────────────────
     device = data.get("device", {})
-    bt_mac = device.get("bluetooth_mac", "")
-    if bt_mac and validate_mac(bt_mac):
-        base.bluetooth_mac = bt_mac
-
     base.pc_name = device.get("pc_name", base.pc_name)
     base.unlock_on_start = device.get("unlock_on_start", base.unlock_on_start)
+
+    # ── [daemon] Wi-Fi/TCP settings ────────────────────────────────────
+    daemon = data.get("daemon", {})
+    base.listen_host = daemon.get("listen_host", base.listen_host)
+    base.listen_port = int(daemon.get("listen_port", base.listen_port))
+    base.poll_interval = float(daemon.get("poll_interval", base.poll_interval))
+    base.poll_timeout = float(daemon.get("poll_timeout", base.poll_timeout))
+    base.pc_name = daemon.get("pc_name", base.pc_name)
+    base.unlock_on_start = daemon.get("unlock_on_start", base.unlock_on_start)
 
     # ── [logging] ─────────────────────────────────────────────────────
     logging_ = data.get("logging", {})
@@ -196,8 +186,15 @@ def write_default_config(path: Optional[Path] = None) -> Path:
 # ── phonect daemon configuration ──────────────────────────────────────────
 # See https://github.com/zumuvik/phonect
 #
-# Bluetooth RFCOMM transport: the daemon connects to the phone directly
-# via Bluetooth (no Wi-Fi needed).
+# Wi-Fi/TCP transport: the daemon advertises over UDP and listens on TCP.
+
+[daemon]
+listen_host = "0.0.0.0"
+listen_port = 9876
+# Seconds between UDP discovery broadcasts during an auth window
+poll_interval = 0.3
+# Maximum seconds to advertise and accept one TCP auth after wake/manual/start
+poll_timeout = 15.0
 
 [keys]
 # Path to the PC's own private key (PEM) — generate with: phonect gen-keys
@@ -207,9 +204,6 @@ private_key = "%s/pc_private.pem"
 public_key = "%s/trusted_device.pub"
 
 [device]
-# Bluetooth MAC address of the phone (format: XX:XX:XX:XX:XX:XX)
-# The phone must be paired at the OS level before running the daemon.
-bluetooth_mac = ""
 # Human-friendly PC name shown during pairing
 pc_name = "my-laptop"
 # Run one auth cycle when the daemon starts
