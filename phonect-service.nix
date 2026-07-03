@@ -36,7 +36,7 @@ let
 
   phonectPackage = pkgs.python3.pkgs.buildPythonPackage rec {
     pname = "phonect";
-    version = "0.4.5";
+    version = "0.4.6";
     src = phonectSrc;
     pyproject = true;
     buildInputs = [ pkgs.python3.pkgs.setuptools ];
