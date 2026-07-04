@@ -284,10 +284,12 @@ class TestDaemonTcpPairing:
             host, port = server.sockets[0].getsockname()
             try:
                 await self._phone(host, port, mobile_kp)
+                await daemon._auth_completed.wait()
                 assert trusted.read_bytes() == mobile_kp.public_key_pem
                 assert unlocks == []
                 daemon._auth_pending = True
                 await self._phone(host, port, mobile_kp)
+                await daemon._auth_completed.wait()
                 assert len(unlocks) == 1
             finally:
                 server.close(); await server.wait_closed()
@@ -337,7 +339,11 @@ class TestDaemonTcpPairing:
                 await writer.drain()
                 with pytest.raises((asyncio.IncompleteReadError, ConnectionResetError, TimeoutError)):
                     await PhonectDaemon._read_frame(reader, timeout=1)
-                writer.close(); await writer.wait_closed()
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except ConnectionResetError:
+                    pass
                 assert unlocks == []
             finally:
                 server.close(); await server.wait_closed()
