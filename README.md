@@ -5,130 +5,187 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](pyproject.toml)
 [![Kotlin](https://img.shields.io/badge/kotlin-1.9%2B-purple)](android/)
 
-**phonect** (phone + connect) — система бесшовной разблокировки Linux-ноутбука с помощью сканера отпечатков пальцев на Android-смартфоне. Связь между устройствами осуществляется напрямую (P2P) по локальной сети Wi-Fi, без сторонних облачных серверов.
+**phonect** (phone + connect) — система бесшовной разблокировки Linux-ноутбука с помощью биометрии Android-смартфона. Связь между ПК и телефоном идёт напрямую по локальной сети Wi‑Fi/LAN: ПК объявляет себя через UDP discovery, телефон подключается обратно к TCP-демону ПК и подтверждает разблокировку подписью из Android Keystore.
+
+Облака, внешние серверы и Bluetooth не используются.
+
+## Текущий транспорт
+
+- UDP discovery: порт `9875`, payload начинается с `PHONECT_DISCOVERY`.
+- TCP daemon: порт по умолчанию `9876`.
+- Android слушает UDP discovery и подключается к TCP listener на ПК.
+- TCP-фреймы: `[4-byte big-endian uint32 length][UTF-8 JSON]`.
+- Максимальный JSON payload: `65_536` байт.
 
 ## Как это работает
 
-```
-┌─────────────────────┐          Wi-Fi LAN           ┌─────────────────────┐
-│   Linux Laptop (PC) │◄────────────────────────────►│  Android Smartphone │
-│                     │    Challenge-Response TCP     │                     │
-│  ┌───────────────┐  │                               │  ┌───────────────┐  │
-│  │ 1. Генерирует  │──┼──── nonce (32 байта) ────────┼─►│ 2. Запрашивает │  │
-│  │    Nonce       │  │                               │  │    отпечаток   │  │
-│  └───────────────┘  │                               │  └───────┬───────┘  │
-│                     │                               │          ▼          │
-│  ┌───────────────┐  │                               │  ┌───────────────┐  │
-│  │ 4. Проверяет   │◄─┼── signature (RSA-4096 PSS) ───┼─┤ 3. Подписывает │  │
-│  │    подпись     │  │                               │  │    Nonce       │  │
-│  └───────┬───────┘  │                               │  └───────────────┘  │
-│          ▼          │                               │                     │
-│  ┌───────────────┐  │                               │  Android Keystore   │
-│  │ loginctl       │  │                               │  BIOMETRIC_STRONG   │
-│  │ unlock-session │  │                               │                     │
-│  └───────────────┘  │                               └─────────────────────┘
-└─────────────────────┘
+```text
+┌─────────────────────┐        Wi‑Fi/LAN         ┌─────────────────────┐
+│   Linux Laptop (PC) │                          │  Android Smartphone │
+│                     │ ── UDP discovery ──────► │                     │
+│  phonect daemon     │ ◄── TCP connect-back ─── │  Foreground service │
+│                     │                          │                     │
+│  1. pair_accept     │ ◄──── pair_hello ─────── │  0. phone key       │
+│  2. challenge nonce │ ───── challenge ───────► │  3. BiometricPrompt │
+│  5. verify + unlock │ ◄──── signature ──────── │  4. sign nonce      │
+│                     │                          │                     │
+│  loginctl           │                          │  Android Keystore   │
+│  unlock-session     │                          │  BIOMETRIC_STRONG   │
+└─────────────────────┘                          └─────────────────────┘
 ```
 
-### Криптографическая схема (Challenge-Response)
+### Pairing / TOFU
 
-1. **На телефоне** генерируется пара ключей **RSA-4096**. Приватный ключ изолирован в Android Keystore с флагом `BIOMETRIC_STRONG`. Публичный ключ передается на ПК при сопряжении.
-2. **При открытии крышки** ноутбука ПК генерирует случайный 32-байтный Nonce и отправляет его на телефон по TCP.
-3. **Телефон** запрашивает отпечаток пальца через `BiometricPrompt`. После успешной аутентификации подписывает Nonce и отправляет подпись обратно.
-4. **ПК** проверяет подпись публичным ключом. При успехе вызывает `loginctl unlock-session`.
+Ручное pairing-командой больше не используется. `phonect pair` оставлен только как deprecated stub.
+
+Текущая схема pairing:
+
+1. Телефон подключается к TCP-демону во время открытого auth window.
+2. Телефон отправляет `pair_hello` с публичным RSA-ключом и fingerprint.
+3. ПК проверяет fingerprint PEM, отвечает `pair_accept` со своим публичным ключом.
+4. Телефон доказывает владение приватным ключом, подписывая nonce.
+5. При первом успешном TOFU ПК сохраняет публичный ключ телефона в `trusted_device.pub`.
+6. **Первое TOFU-соединение не разблокирует сессию**. Разблокировка разрешена только на последующих соединениях с уже закреплённым ключом.
+
+### Криптография
+
+- RSA-4096.
+- Nonce: 32 случайных байта, 64 hex-символа.
+- Подпись: RSA-PSS/SHA-512.
+- Python и Android должны использовать одинаковую PSS salt length: `64` байта.
+- Android хранит приватный ключ в Android Keystore, с биометрическим подтверждением (`BIOMETRIC_STRONG`, StrongBox/TEE в зависимости от устройства).
+- Доверие основано на публичных ключах, а не на IP-адресах.
 
 ## Структура проекта
 
-```
+```text
 phonect/
 ├── src/phonect/
-│   ├── __init__.py         # Пакет
-│   ├── crypto.py           # RSA-4096: генерация ключей, Nonce, подпись, верификация
-│   ├── protocol.py         # Сетевой протокол (JSON length-prefixed frames, 64KB limit)
-│   ├── handshake.py        # Оркестрация handshake (PC + mobile, mutual-auth skeleton)
-│   ├── daemon.py           # Фоновый asyncio-демон (D-Bus logind, poll, unlock)
-│   ├── config.py           # Конфигурация (TOML, ~/.config/phonect/)
-│   └── cli.py              # CLI: gen-keys, server, client, daemon, init-config
-├── android/                # 📱 Android-приложение (Kotlin)
+│   ├── __init__.py
+│   ├── cli.py              # CLI: gen-keys, init-config, daemon, tui, dev server/client
+│   ├── config.py           # TOML config, defaults, UDP/TCP settings
+│   ├── crypto.py           # RSA-4096, nonce, fingerprint, sign/verify
+│   ├── daemon.py           # asyncio daemon: D-Bus resume, UDP discovery, TCP auth, unlock
+│   ├── handshake.py        # Dev/test TCP challenge-response server/client
+│   ├── protocol.py         # JSON length-prefixed frames, message builders/validators
+│   ├── state.py            # Legacy state.json compatibility helper
+│   └── tui.py              # Textual TUI for status/pairing/logs
+├── android/                # Android app, Kotlin/JDK 17
 │   └── app/src/main/java/com/phonect/android/
-│       ├── crypto/CryptoManager.kt      # RSA-4096 в Android Keystore + биометрия
-│       ├── network/PhonectNetworkService.kt  # UDP discovery + TCP client service
-│       ├── network/ProtocolHandler.kt   # Парсинг фреймов (64KB limit)
-│       ├── biometric/BiometricHandler.kt     # BiometricPrompt wrapper
-│       ├── model/HandshakeModels.kt     # Data-классы сообщений
-│       └── ui/MainActivity.kt           # UI управления сервисом
-├── phonect-service.nix     # ❄️ NixOS модуль: systemd service + Polkit + hardening
+│       ├── biometric/BiometricHandler.kt
+│       ├── crypto/CryptoManager.kt
+│       ├── logging/LogManager.kt
+│       ├── model/HandshakeModels.kt
+│       ├── network/PhonectNetworkService.kt
+│       ├── network/ProtocolHandler.kt
+│       └── ui/MainActivity.kt
+├── phonect-service.nix     # NixOS module: package, config, firewall, user service
 ├── scripts/
-│   └── e2e_cli_test.py     # End-to-end интеграционный тест
+│   └── e2e_cli_test.py     # Dev E2E test using CLI server/client
 ├── tests/
-│   ├── test_handshake.py   # Unit-тесты handshake
-│   └── test_daemon.py      # Тесты демона (config, session, async handshake)
-├── .github/workflows/
-│   └── tests.yml           # CI: pytest при каждом пуше
-├── SECURITY.md             # Threat model
-├── CONTRIBUTING.md         # Правила для контрибьюторов
-└── LICENSE                 # MIT
+│   ├── test_daemon.py
+│   ├── test_handshake.py
+│   ├── test_protocol_security.py
+│   └── test_state.py
+├── SECURITY.md
+├── CONTRIBUTING.md
+└── LICENSE
 ```
 
-## Быстрый старт (Шаг 1 — прототип)
+## Установка и запуск на ПК
 
 ```bash
-# Клонировать
 git clone https://github.com/zumuvik/phonect.git
 cd phonect
 
-# Установить
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 
-# Сгенерировать ключи
-phonect gen-keys
+phonect gen-keys --private-key ~/.config/phonect/pc_private.pem \
+                 --public-key ~/.config/phonect/pc_public.pem
+phonect init-config
+phonect daemon --foreground
+```
 
-# Запустить ПК-сервер (в терминале 1)
-phonect server phonect_public.pem --port 9999
+По умолчанию config находится в:
 
-# Запустить эмулятор мобилки (в терминале 2)
-phonect client phonect_private.pem 127.0.0.1 9999
+- `$XDG_CONFIG_HOME/phonect/config.toml`, если задан `XDG_CONFIG_HOME`;
+- иначе `~/.config/phonect/config.toml`.
 
-# Или запустить полный E2E тест
-python scripts/e2e_cli_test.py
+Важные настройки:
+
+```toml
+[daemon]
+listen_host = "0.0.0.0"
+listen_port = 9876
+poll_interval = 0.3
+poll_timeout = 15.0
+
+[keys]
+private_key = "/home/user/.config/phonect/pc_private.pem"
+public_key = "/home/user/.config/phonect/trusted_device.pub"
+
+[device]
+pc_name = "my-laptop"
+unlock_on_start = false
 ```
 
 ## CLI-команды
 
 | Команда | Описание |
 |---------|----------|
-| `phonect gen-keys` | Генерация RSA-4096 ключей |
-| `phonect server <pubkey>` | Запуск ПК-сервера (ожидает мобилку) |
-| `phonect client <privkey> <ip> <port>` | Эмуляция Android-клиента |
-| `phonect daemon` | 🆕 Запуск фонового демона (D-Bus + poll + unlock) |
-| `phonect init-config` | 🆕 Создать шаблон config.toml |
+| `phonect gen-keys` | Генерация RSA-4096 пары ключей |
+| `phonect init-config [--path <path>]` | Создать шаблон `config.toml` |
+| `phonect daemon [--config <path>] [--foreground]` | Запуск Wi‑Fi/TCP daemon |
+| `phonect tui` | Textual TUI для статуса, pairing/logs |
+| `phonect pair` | Deprecated: ручной pairing отключён, используется daemon-side TOFU |
+| `phonect server <public_key> [--port <port>]` | Dev PC challenge server |
+| `phonect client <private_key> <pc_ip> <pc_port>` | Dev mobile emulator client |
 
-## План реализации
+Dev E2E:
 
-- [x] **Шаг 1**: Прототип криптографического handshake (RSA-4096, Nonce, подпись, верификация) — **готов**
-- [x] **Шаг 2**: Фоновый демон для Linux с интеграцией `systemd-logind` и `suspend.target` — **готов**
-- [x] **Шаг 3**: Android-приложение (Keystore, BiometricPrompt, Foreground Service) — **готов**
-  - `CryptoManager.kt` — RSA-4096 в Android Keystore с BIOMETRIC_STRONG
-  - `PhonectNetworkService.kt` — Foreground Service, UDP discovery + TCP connection, Wi-Fi awareness
-  - `BiometricHandler.kt` — BiometricPrompt интеграция
-  - `ProtocolHandler.kt` — парсинг фреймов phonect.protocol
-- [ ] **Шаг 4**: TUI-конфигуратор с QR-кодом и менеджером устройств
+```bash
+python scripts/e2e_cli_test.py
+```
 
-## Демон (Шаг 2)
+## Демон
 
-Фоновый демон (`phonect daemon`) интегрируется с `systemd-logind` через D-Bus:
+`phonect daemon`:
 
-1. **D-Bus listener**: подписывается на сигнал `PrepareForSleep` от `org.freedesktop.login1.Manager`.
-2. **При wakeup** (PrepareForSleep=false): запускает агрессивный цикл опроса — пытается соединиться с телефоном каждые 200 мс в течение 10 секунд.
-3. **При успешном соединении**: выполняется Challenge-Response handshake.
-4. **При успешной верификации**: `loginctl unlock-session <id>` для всех активных сессий пользователя.
-5. **SIGUSR1**: ручной триггер цикла аутентификации (без сна).
+1. Загружает приватный ключ ПК и доверенный публичный ключ телефона, если он уже есть.
+2. Запускает TCP listener на `listen_host:listen_port`.
+3. Подписывается на `org.freedesktop.login1.Manager.PrepareForSleep` через system D-Bus.
+4. При resume (`PrepareForSleep=false`) открывает ограниченное auth window.
+5. Во время auth window отправляет UDP discovery и принимает одно TCP authentication-соединение.
+6. При успешной проверке закреплённого ключа вызывает `loginctl unlock-session` для активных сессий пользователя.
 
-### NixOS модуль
+Дополнительно:
 
-Файл `phonect-service.nix` — готовый NixOS-модуль для включения в конфигурацию:
+- `unlock_on_start = true` запускает auth cycle при старте daemon.
+- `SIGUSR1` используется как ручной trigger auth cycle.
+- Подключения вне auth window закрываются без разблокировки.
+- Если телефон подключился с новым ключом, первый успешный TOFU сохраняет ключ, но не разблокирует.
+
+## Android-приложение
+
+Android app находится в `android/` и собирается Gradle/JDK 17.
+
+Основные компоненты:
+
+- `PhonectNetworkService.kt` — foreground service: слушает UDP discovery, подключается к TCP daemon, выполняет TOFU/auth flow.
+- `ProtocolHandler.kt` — чтение/запись length-prefixed JSON frames.
+- `HandshakeModels.kt` — Kotlin-модели сообщений, порты и discovery constants.
+- `CryptoManager.kt` — Android Keystore, RSA-4096, fingerprint PEM, biometric-bound signing.
+- `BiometricHandler.kt` — wrapper над `BiometricPrompt`.
+- `MainActivity.kt` — управление сервисом, статус, текущая Activity для `BiometricPrompt` через `WeakReference`.
+- `LogManager.kt` — локальные логи приложения.
+
+Разрешения Android: `INTERNET`, `ACCESS_NETWORK_STATE`, `ACCESS_WIFI_STATE`, foreground service и `USE_BIOMETRIC`. Bluetooth permissions не требуются.
+
+## NixOS module
+
+`phonect-service.nix` предоставляет NixOS-модуль:
 
 ```nix
 {
@@ -139,24 +196,55 @@ python scripts/e2e_cli_test.py
     settings = {
       keys.public_key = "/home/user/.config/phonect/trusted_device.pub";
       keys.private_key = "/home/user/.config/phonect/pc_private.pem";
+
+      device.pc_name = "my-laptop";
+      device.unlock_on_start = false;
+
       daemon.listen_host = "0.0.0.0";
       daemon.listen_port = 9876;
+      daemon.poll_interval = 0.3;
+      daemon.poll_timeout = 15.0;
+
+      logging.level = "INFO";
     };
   };
 }
 ```
 
-Модуль автоматизирует:
-- Сборку Python-пакета с зависимостями (`cryptography`, `dbus-next`)
-- Генерацию config.toml из опций
-- Открытие TCP-порта демона и UDP discovery-порта 9875 в firewall
-- Systemd-сервис с security hardening
-- Запуск сервиса после `network.target` и `suspend.target`
+Модуль:
+
+- собирает Python package и добавляет CLI в `environment.systemPackages`;
+- пишет config в `/etc/phonect/config.toml`;
+- открывает UDP `9875` и настроенный TCP порт daemon;
+- запускает `systemd.user.services.phonect` от пользователя, не root;
+- включает lightweight hardening для user service.
+
+## Тесты
+
+Текущие тесты:
+
+- `tests/test_handshake.py` — challenge-response, wrong-key rejection, biometric decline.
+- `tests/test_daemon.py` — config, session detection, daemon TCP pairing/auth, TOFU, auth window.
+- `tests/test_protocol_security.py` — max frame size, malformed JSON, nonce/signature validation.
+- `tests/test_state.py` — legacy `state.json` helpers.
+- `scripts/e2e_cli_test.py` — dev E2E через `phonect server` + `phonect client`.
+
+Локально обычная команда для CI/dev окружения:
+
+```bash
+pip install -e ".[dev]"
+pytest tests/ -v --tb=short
+```
+
+Для AI-агентов это считается тяжёлой операцией, если занимает заметное время: см. следующий раздел.
 
 ## Требования
 
-- Python ≥ 3.11
-- Библиотека `cryptography` (устанавливается автоматически)
+- Python >= 3.11.
+- Python dependencies: `cryptography`, `dbus-next`.
+- Optional TUI dependencies: `textual`, `qrcode` (`pip install -e ".[tui]"`).
+- Android: Kotlin/JDK 17, Android Gradle project in `android/`.
+- NixOS module users: NixOS with user systemd services and firewall configuration.
 
 ## Лицензия
 

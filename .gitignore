@@ -30,6 +30,7 @@ android/captures/
 # Agent instructions (local per-developer, not project-tracked)
 AGENTS.md
 CLAUDE.md
+REMOTE_BUILD.md
 .cursorrules
 .cursor/
 
