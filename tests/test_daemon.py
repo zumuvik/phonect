@@ -8,8 +8,11 @@ D-Bus integration is tested via mocks/stubs (no system bus required).
 from __future__ import annotations
 
 import asyncio
+import errno
+import logging
 import os
 import tempfile
+import socket
 from pathlib import Path
 from typing import List, Optional
 
@@ -415,6 +418,56 @@ class TestDaemonTcpPairing:
             finally:
                 daemon.stop()
                 await asyncio.wait_for(task, timeout=2)
+
+    @pytest.mark.asyncio
+    async def test_broadcast_discovery_window_survives_enetunreach(self, monkeypatch, caplog):
+        cfg = DaemonConfig(poll_timeout=0.12, poll_interval=0.01)
+        daemon = PhonectDaemon(cfg)
+        daemon._auth_pending = True
+
+        sends = []
+
+        class FakeSocket:
+            def setsockopt(self, *args, **kwargs):
+                return None
+
+            def sendto(self, payload, addr):
+                sends.append((payload, addr))
+                raise OSError(errno.ENETUNREACH, "Network is unreachable")
+
+            def close(self):
+                sends.append((b"closed", None))
+
+        monkeypatch.setattr(socket, "socket", lambda *args, **kwargs: FakeSocket())
+        caplog.set_level(logging.WARNING, logger="phonect.daemon")
+
+        await daemon._broadcast_discovery_window()
+
+        assert "UDP discovery failed: Network is unreachable" in caplog.text
+        assert any(item[0] == b"closed" for item in sends)
+        assert len([item for item in sends if item[1] is not None]) >= 1
+
+    @pytest.mark.asyncio
+    async def test_auth_cycle_stays_alive_when_discovery_network_unreachable(self, monkeypatch):
+        cfg = DaemonConfig(poll_timeout=0.12, poll_interval=0.01)
+        daemon = PhonectDaemon(cfg)
+        daemon._auth_completed.clear()
+
+        class FakeSocket:
+            def setsockopt(self, *args, **kwargs):
+                return None
+
+            def sendto(self, payload, addr):
+                raise OSError(errno.ENETUNREACH, "Network is unreachable")
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(socket, "socket", lambda *args, **kwargs: FakeSocket())
+
+        await daemon._run_auth_cycle()
+        assert daemon._auth_pending is False
+        assert daemon._auth_in_progress is False
 
     @pytest.mark.asyncio
     async def test_async_handshake_wrong_key_rejected(self):

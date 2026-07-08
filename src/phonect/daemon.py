@@ -18,6 +18,7 @@ On resume-from-sleep (``PrepareForSleep`` D-Bus signal), the daemon:
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -304,6 +305,7 @@ class PhonectDaemon:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         try:
             deadline = asyncio.get_running_loop().time() + self.config.poll_timeout
+            warned_network_unreachable = False
             while self._auth_pending and asyncio.get_running_loop().time() <= deadline:
                 fp16 = "unknown"
                 if self._pc_private_key is not None:
@@ -312,10 +314,19 @@ class PhonectDaemon:
                     f"PHONECT_DISCOVERY:{self.config.pc_name or socket.gethostname()}:"
                     f"{fp16}:{self._actual_listen_port}"
                 ).encode("utf-8")
-                sock.sendto(payload, ("255.255.255.255", UDP_DISCOVERY_PORT))
+                try:
+                    sock.sendto(payload, ("255.255.255.255", UDP_DISCOVERY_PORT))
+                except OSError as exc:
+                    if exc.errno == errno.ENETUNREACH:
+                        if not warned_network_unreachable:
+                            LOG.warning("UDP discovery failed: %s", exc.strerror or exc)
+                            warned_network_unreachable = True
+                        else:
+                            LOG.debug("UDP discovery still unavailable: %s", exc.strerror or exc)
+                        await asyncio.sleep(min(0.25, max(0.05, self.config.poll_interval / 2)))
+                        continue
+                    raise
                 await asyncio.sleep(self.config.poll_interval)
-        except asyncio.CancelledError:
-            pass
         finally:
             sock.close()
 
