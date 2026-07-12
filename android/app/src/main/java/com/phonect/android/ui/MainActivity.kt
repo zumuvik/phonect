@@ -25,7 +25,6 @@ import com.phonect.android.network.PhonectNetworkService
  * - Service start/stop controls
  * - Status display
  * - Biometric readiness check
- * - Public key management (future: QR-code pairing)
  * - Real-time log display and share
  */
 class MainActivity : AppCompatActivity() {

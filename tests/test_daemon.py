@@ -441,7 +441,10 @@ class TestDaemonTcpPairing:
         monkeypatch.setattr(socket, "socket", lambda *args, **kwargs: FakeSocket())
         caplog.set_level(logging.WARNING, logger="phonect.daemon")
 
-        await daemon._broadcast_discovery_window()
+        try:
+            await daemon._broadcast_discovery_window()
+        finally:
+            monkeypatch.undo()
 
         assert "UDP discovery failed: Network is unreachable" in caplog.text
         assert any(item[0] == b"closed" for item in sends)
@@ -465,7 +468,10 @@ class TestDaemonTcpPairing:
 
         monkeypatch.setattr(socket, "socket", lambda *args, **kwargs: FakeSocket())
 
-        await daemon._run_auth_cycle()
+        try:
+            await daemon._run_auth_cycle()
+        finally:
+            monkeypatch.undo()
         assert daemon._auth_pending is False
         assert daemon._auth_in_progress is False
 

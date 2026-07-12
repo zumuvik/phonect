@@ -69,9 +69,6 @@ dependencies {
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 
-    // QR code scanning (pairing)
-    implementation("com.google.mlkit:barcode-scanning:17.2.0")
-
     // JSON serialisation
     implementation("com.google.code.gson:gson:2.10.1")
 

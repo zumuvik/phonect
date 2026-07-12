@@ -134,13 +134,8 @@ def cmd_pair(args: argparse.Namespace) -> None:
     print("The first valid phone key will be pinned, but that first connection will not unlock.")
 
 
-def cmd_tui(_args: argparse.Namespace) -> None:
-    """Launch the Textual TUI."""
-    from phonect.tui import run_tui
-    run_tui()
-
-
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """Build the development CLI argument parser."""
     parser = argparse.ArgumentParser(
         prog="phonect",
         description="P2P Biometric Laptop Unlock — development CLI",
@@ -186,11 +181,11 @@ def main() -> None:
     pr.add_argument("--config", help="Path to config.toml (default: ~/.config/phonect/config.toml)")
     pr.set_defaults(func=cmd_pair)
 
-    # tui
-    tui_p = sub.add_parser("tui", help="Launch the Textual TUI (pairing, status, logs)")
-    tui_p.set_defaults(func=cmd_tui)
+    return parser
 
-    args = parser.parse_args()
+
+def main() -> None:
+    args = build_parser().parse_args()
     args.func(args)
 
 

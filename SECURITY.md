@@ -56,7 +56,7 @@ scan performed on an Android phone.
 |------|-------------|--------------------------|
 | **Fingerprint biometric data** | Android device only (BiometricPrompt / Keystore). **Never** leaves the phone. | ❌ No |
 | **Private key (RSA-4096)** | Android Hardware-backed Keystore (TEE/StrongBox). | ❌ No |
-| **Public key** | PC filesystem + Android memory. | ✅ Yes (during pairing via QR code) |
+| **Public key** | PC filesystem + Android memory. | ✅ Yes (during TCP pairing) |
 | **Nonce (random challenge)** | PC memory + TCP frame. | ✅ Yes (plaintext — safe by design) |
 | **Signature** | TCP frame. | ✅ Yes (plaintext — safe by design, proves nothing without the private key) |
 

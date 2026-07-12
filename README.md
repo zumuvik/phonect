@@ -62,14 +62,13 @@
 phonect/
 ├── src/phonect/
 │   ├── __init__.py
-│   ├── cli.py              # CLI: gen-keys, init-config, daemon, tui, dev server/client
+│   ├── cli.py              # CLI: gen-keys, init-config, daemon, dev server/client
 │   ├── config.py           # TOML config, defaults, UDP/TCP settings
 │   ├── crypto.py           # RSA-4096, nonce, fingerprint, sign/verify
 │   ├── daemon.py           # asyncio daemon: D-Bus resume, UDP discovery, TCP auth, unlock
 │   ├── handshake.py        # Dev/test TCP challenge-response server/client
 │   ├── protocol.py         # JSON length-prefixed frames, message builders/validators
-│   ├── state.py            # Legacy state.json compatibility helper
-│   └── tui.py              # Textual TUI for status/pairing/logs
+│   └── state.py            # Legacy state.json compatibility helper
 ├── android/                # Android app, Kotlin/JDK 17
 │   └── app/src/main/java/com/phonect/android/
 │       ├── biometric/BiometricHandler.kt
@@ -83,6 +82,7 @@ phonect/
 ├── scripts/
 │   └── e2e_cli_test.py     # Dev E2E test using CLI server/client
 ├── tests/
+│   ├── test_cli.py
 │   ├── test_daemon.py
 │   ├── test_handshake.py
 │   ├── test_protocol_security.py
@@ -138,8 +138,7 @@ unlock_on_start = false
 | `phonect gen-keys` | Генерация RSA-4096 пары ключей |
 | `phonect init-config [--path <path>]` | Создать шаблон `config.toml` |
 | `phonect daemon [--config <path>] [--foreground]` | Запуск Wi‑Fi/TCP daemon |
-| `phonect tui` | Textual TUI для статуса, pairing/logs |
-| `phonect pair` | Deprecated: ручной pairing отключён, используется daemon-side TOFU |
+| `phonect pair [--config <path>]` | Deprecated: ручной pairing отключён, используется daemon-side TOFU |
 | `phonect server <public_key> [--port <port>]` | Dev PC challenge server |
 | `phonect client <private_key> <pc_ip> <pc_port>` | Dev mobile emulator client |
 
@@ -223,6 +222,7 @@ Android app находится в `android/` и собирается Gradle/JDK 
 
 Текущие тесты:
 
+- `tests/test_cli.py` — CLI-команды, импорт без удалённых TUI-зависимостей и metadata-проверки.
 - `tests/test_handshake.py` — challenge-response, wrong-key rejection, biometric decline.
 - `tests/test_daemon.py` — config, session detection, daemon TCP pairing/auth, TOFU, auth window.
 - `tests/test_protocol_security.py` — max frame size, malformed JSON, nonce/signature validation.
@@ -242,7 +242,6 @@ pytest tests/ -v --tb=short
 
 - Python >= 3.11.
 - Python dependencies: `cryptography`, `dbus-next`.
-- Optional TUI dependencies: `textual`, `qrcode` (`pip install -e ".[tui]"`).
 - Android: Kotlin/JDK 17, Android Gradle project in `android/`.
 - NixOS module users: NixOS with user systemd services and firewall configuration.
 

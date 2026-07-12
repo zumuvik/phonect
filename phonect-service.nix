@@ -28,26 +28,7 @@
 
 let
   cfg = config.services.phonect;
-
-  phonectSrc = lib.cleanSourceWith {
-    src = lib.cleanSource ./.;
-    name = "phonect-source";
-  };
-
-  phonectPackage = pkgs.python3.pkgs.buildPythonPackage rec {
-    pname = "phonect";
-    version = "0.4.6";
-    src = phonectSrc;
-    pyproject = true;
-    buildInputs = [ pkgs.python3.pkgs.setuptools ];
-    propagatedBuildInputs = with pkgs.python3.pkgs; [
-      cryptography
-      dbus-next
-      textual        # TUI (required — always included)
-      qrcode         # TUI QR-code rendering
-    ];
-    doCheck = false;
-  };
+  phonectPackage = pkgs.callPackage ./package.nix { };
 
   # ── TOML config file generator ──────────────────────────────────────
   configFile = pkgs.writeText "phonect-config.toml" (
@@ -84,7 +65,7 @@ in {
     package = lib.mkOption {
       type = lib.types.package;
       default = phonectPackage;
-      defaultText = lib.literalExpression "phonect package with all extras";
+      defaultText = lib.literalExpression "phonect package";
       description = "The phonect Python package derivation.";
     };
 
