@@ -256,6 +256,26 @@ phonect client phone_private.pem 127.0.0.1 9876 --device-name android-emulator
 
 ## Android
 
+### Release signing
+
+Create the owner keystore (password prompts are intentional) and store offline backups outside the repository:
+
+```bash
+keytool -genkeypair -keystore phonect-release.jks -alias phonect -keyalg RSA -keysize 4096 -validity 10000
+base64 -w 0 phonect-release.jks                 # Linux
+base64 < phonect-release.jks | tr -d '\n'       # macOS
+keytool -list -v -keystore phonect-release.jks -alias phonect | grep 'SHA256:'
+```
+
+Normalize the exact alias SHA-256 digest to 64 uppercase hexadecimal characters. Configure GitHub Secrets: `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD`; configure the required `ANDROID_SIGNING_CERT_SHA256` GitHub Variable. For a local release build:
+
+```bash
+cd android
+ANDROID_KEYSTORE_PATH=/secure/phonect-release.jks ANDROID_KEYSTORE_PASSWORD=... ANDROID_KEY_ALIAS=phonect ANDROID_KEY_PASSWORD=... ./gradlew :app:assembleRelease
+```
+
+`versionCode` must increase for every published APK. APKs signed by an unavailable prior/debug key cannot be transparently migrated or installed as updates; users must uninstall first, which may lose application data. Use the dispatch-only **Release — Android** workflow with an existing `vX.Y.Z` tag and GitHub Release; debug CI artifacts are diagnostic only.
+
 Android-приложение использует foreground service. Он слушает UDP discovery, соединяется с daemon по TCP, выполняет TOFU и проверку ключа ПК, а затем использует `BiometricPrompt` для подписи nonce.
 
 Поддерживаемые параметры сборки: minSdk 28, compileSdk/targetSdk 34, JDK 17. Application ID: `com.phonect.android`.
@@ -304,7 +324,7 @@ cd android
 - Nix workflow выполняет flake checks, сборку пакета и проверку CLI.
 - Android workflow запускает `testDebugUnitTest assembleDebug` с JDK 17 и публикует debug APK как artifact на 7 дней.
 
-Автоматического workflow публикации релизов нет. Текущий процесс релиза — вручную создать commit и tag, собрать APK, проверить manifest и checksum, затем создать GitHub Release с приложенным APK. Debug APK должен быть явно помечен как diagnostic/debug build, а не как production release.
+Для релиза создайте commit и существующий `vX.Y.Z` tag/GitHub Release, затем запустите dispatch workflow **Release — Android** с этим tag. Debug APK должен быть явно помечен как diagnostic/debug build, а не production release.
 
 ## Сборка
 

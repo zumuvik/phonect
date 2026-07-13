@@ -2,7 +2,7 @@
 
 python3Packages.buildPythonPackage {
   pname = "phonect";
-  version = "0.4.7.1";
+  version = "0.4.7.2";
   src = lib.fileset.toSource {
     root = ./.;
     fileset = lib.fileset.unions [

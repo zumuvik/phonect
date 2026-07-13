@@ -1,0 +1,109 @@
+name: Release — Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (vX.Y.Z)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      verified_sha: ${{ steps.validate.outputs.sha }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate tag, release, and main reachability
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*$ ]]
+          git merge-base --is-ancestor HEAD origin/main
+          gh release view "$RELEASE_TAG" >/dev/null
+          printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: android-release
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ needs.verify.outputs.verified_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5.5.0
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - name: Verify immutable tag target
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          VERIFIED_SHA: ${{ needs.verify.outputs.verified_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force origin
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$VERIFIED_SHA"
+      - name: Build and verify signed release APK
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_SIGNING_CERT_SHA256: ${{ vars.ANDROID_SIGNING_CERT_SHA256 }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        working-directory: android
+        run: |
+          set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/phonect-release.keystore"' EXIT
+          for value in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD ANDROID_SIGNING_CERT_SHA256; do test -n "${!value}" || { echo "Missing required $value"; exit 1; }; done
+          version="${RELEASE_TAG#v}"
+          umask 077
+          key="$RUNNER_TEMP/phonect-release.keystore"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$key"
+          export ANDROID_KEYSTORE_PATH="$key"
+          ./gradlew --no-daemon :app:assembleRelease
+          apk=app/build/outputs/apk/release/app-release.apk
+          test -f "$apk"
+          test -n "${ANDROID_HOME:-}" && test -d "$ANDROID_HOME/build-tools"
+          tools="$ANDROID_HOME/build-tools/$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -V | tail -n1)"
+          test -x "$tools/apksigner" && test -x "$tools/aapt"
+          digest=$("$tools/apksigner" verify --verbose --print-certs "$apk" | sed -n 's/.*SHA-256 digest:[[:space:]]*//p' | head -n1 | tr -d '[:space:]:' | tr '[:lower:]' '[:upper:]')
+          expected=$(printf '%s' "$ANDROID_SIGNING_CERT_SHA256" | tr -d '[:space:]:' | tr '[:lower:]' '[:upper:]')
+          [[ "$digest" =~ ^[0-9A-F]{64}$ ]] && [[ "$expected" =~ ^[0-9A-F]{64}$ ]] && test "$digest" = "$expected"
+          badging=$("$tools/aapt" dump badging "$apk")
+          package=$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" <<< "$badging")
+          version_name=$(sed -n "s/.*versionName='\([^']*\)'.*/\1/p" <<< "$badging")
+          test "$package" = "com.phonect.android"
+          test "$version_name" = "$version"
+          code=$(sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p" <<< "$badging")
+          [[ "$code" =~ ^[0-9]+$ ]] && (( code > 0 && code <= 2147483647 ))
+          cp "$apk" "$RUNNER_TEMP/phonect-${version}.apk"
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          VERIFIED_SHA: ${{ needs.verify.outputs.verified_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force origin
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$VERIFIED_SHA"
+          version="${RELEASE_TAG#v}"
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/phonect-${version}.apk"

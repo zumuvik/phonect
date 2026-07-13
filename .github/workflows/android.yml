@@ -44,10 +44,10 @@ jobs:
         working-directory: android
         run: ./gradlew --no-daemon testDebugUnitTest assembleDebug
 
-      - name: Upload debug APK
+      - name: Upload diagnostic debug APK
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: phonect-debug-apk
+          name: phonect-diagnostic-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 7
           if-no-files-found: error

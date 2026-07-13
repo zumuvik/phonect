@@ -3,6 +3,15 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+fun signingInput(name: String): String? = providers.gradleProperty(name).orNull
+    ?: providers.environmentVariable(name).orNull
+
+val releaseSigningInputs = listOf(
+    "ANDROID_KEYSTORE_PATH", "ANDROID_KEYSTORE_PASSWORD", "ANDROID_KEY_ALIAS", "ANDROID_KEY_PASSWORD",
+).associateWith(::signingInput)
+val releaseKeystore = releaseSigningInputs["ANDROID_KEYSTORE_PATH"]?.let(::file)
+val hasReleaseSigning = releaseSigningInputs.values.all { !it.isNullOrBlank() } && releaseKeystore?.isFile == true
+
 android {
     namespace = "com.phonect.android"
     compileSdk = 34
@@ -11,25 +20,25 @@ android {
         applicationId = "com.phonect.android"
         minSdk = 28          // Android 9 — BiometricPrompt available
         targetSdk = 34
-        versionCode = 9
-        versionName = "0.4.7.1"
+        versionCode = 10
+        versionName = "0.4.7.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     signingConfigs {
-        create("release") {
-            storeFile = file("/home/zumuvik/.android/debug.keystore")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
+        if (hasReleaseSigning) create("release") {
+            storeFile = releaseKeystore
+            storePassword = releaseSigningInputs.getValue("ANDROID_KEYSTORE_PASSWORD")
+            keyAlias = releaseSigningInputs.getValue("ANDROID_KEY_ALIAS")
+            keyPassword = releaseSigningInputs.getValue("ANDROID_KEY_PASSWORD")
         }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = true
-            signingConfig = signingConfigs.getByName("release")
+            if (hasReleaseSigning) signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -48,6 +57,16 @@ android {
 
     buildFeatures {
         viewBinding = true
+    }
+}
+
+tasks.matching { it.name.contains("Release", ignoreCase = true) }.configureEach {
+    doFirst {
+        val missing = releaseSigningInputs.filterValues { it.isNullOrBlank() }.keys
+        require(missing.isEmpty()) { "Release signing requires: ${missing.joinToString(", ")}" }
+        require(file(releaseSigningInputs.getValue("ANDROID_KEYSTORE_PATH")!!).isFile) {
+            "Release signing keystore does not exist: ANDROID_KEYSTORE_PATH"
+        }
     }
 }
 
