@@ -4,6 +4,8 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Build
 import android.os.IBinder
 import androidx.biometric.BiometricPrompt
@@ -23,7 +25,6 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.util.UUID
-import java.util.Collections
 
 /**
  * Foreground Service that listens for Wi-Fi UDP discovery from the PC.
@@ -42,6 +43,7 @@ class PhonectNetworkService : Service() {
         private const val NOTIFICATION_ID = 1
         private const val PREFS_NAME = "phonect_prefs"
         private const val PREFS_PAIRED_PCS = "paired_pcs"
+        private const val BIOMETRIC_TIMEOUT_MS = 30_000L
 
         const val ACTION_START = "com.phonect.android.START"
         const val ACTION_STOP = "com.phonect.android.STOP"
@@ -65,7 +67,45 @@ class PhonectNetworkService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var listenJob: Job? = null
     private var discoverySocket: DatagramSocket? = null
-    private val inFlightConnections = Collections.synchronizedSet(mutableSetOf<String>())
+    private val listenerLock = Any()
+    private val attempts = InFlightAttemptRegistry<String> { key -> LogManager.i(TAG, "Cleared in-flight state for $key") }
+    private var listenerDesired = false
+    private var currentDefaultNetwork: Network? = null
+    private var networkCallbackRegistered = false
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            val replaced = synchronized(listenerLock) {
+                val previous = currentDefaultNetwork
+                currentDefaultNetwork = network
+                listenerDesired && previous != null && previous != network
+            }
+            LogManager.i(TAG, "Default network available")
+            if (replaced) {
+                val previousListener = cancelTransport("default network replaced")
+                serviceScope.launch {
+                    previousListener?.join()
+                    val mayRestart = synchronized(listenerLock) {
+                        listenerDesired && currentDefaultNetwork == network
+                    }
+                    if (mayRestart) startWifiListener()
+                }
+            } else if (synchronized(listenerLock) { listenerDesired }) {
+                startWifiListener()
+            }
+        }
+
+        override fun onLost(network: Network) {
+            val lostCurrentNetwork = synchronized(listenerLock) {
+                if (currentDefaultNetwork != network) false else {
+                    currentDefaultNetwork = null
+                    true
+                }
+            }
+            if (lostCurrentNetwork) {
+                cancelTransport("default network lost")
+            }
+        }
+    }
 
     private lateinit var cryptoManager: CryptoManager
     private lateinit var prefs: SharedPreferences
@@ -81,6 +121,9 @@ class PhonectNetworkService : Service() {
         cryptoManager = CryptoManager(this)
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         createNotificationChannel()
+        val connectivity = getSystemService(ConnectivityManager::class.java)
+        connectivity.registerDefaultNetworkCallback(networkCallback)
+        networkCallbackRegistered = true
 
         serviceScope.launch {
             cryptoManager.generateKeyIfNeeded()
@@ -93,11 +136,15 @@ class PhonectNetworkService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
+                synchronized(listenerLock) { listenerDesired = true }
                 val notification = buildNotification("Listening for PC via Wi-Fi…", false)
                 startForeground(NOTIFICATION_ID, notification)
                 startWifiListener()
             }
-            ACTION_STOP -> stopWifiListener()
+            ACTION_STOP -> {
+                synchronized(listenerLock) { listenerDesired = false }
+                stopWifiListener()
+            }
         }
         return START_STICKY
     }
@@ -105,7 +152,12 @@ class PhonectNetworkService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        stopWifiListener()
+        synchronized(listenerLock) { listenerDesired = false }
+        cancelTransport("service destroyed")
+        if (networkCallbackRegistered) {
+            getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(networkCallback)
+            networkCallbackRegistered = false
+        }
         serviceScope.cancel()
         super.onDestroy()
     }
@@ -145,14 +197,22 @@ class PhonectNetworkService : Service() {
     // ------------------------------------------------------------------
 
     private fun startWifiListener() {
-        if (listenJob?.isActive == true) return
-
-        listenJob = serviceScope.launch {
+        lateinit var owner: Job
+        owner = serviceScope.launch(start = CoroutineStart.LAZY) {
+            var localSocket: DatagramSocket? = null
             try {
-                discoverySocket = DatagramSocket(UDP_DISCOVERY_PORT, InetAddress.getByName("0.0.0.0")).apply {
+                localSocket = DatagramSocket(UDP_DISCOVERY_PORT, InetAddress.getByName("0.0.0.0")).apply {
                     broadcast = true
                     soTimeout = 1000
                 }
+                val publish = synchronized(listenerLock) {
+                    listenJob === owner && listenerDesired && owner.isActive
+                }
+                if (!publish) {
+                    try { localSocket?.close() } catch (_: Exception) { }
+                    return@launch
+                }
+                synchronized(listenerLock) { discoverySocket = localSocket }
                 LogManager.i(TAG, "UDP discovery listening on $UDP_DISCOVERY_PORT")
                 updateNotification("Listening for PC via Wi-Fi")
                 broadcastStatus("listening:$UDP_DISCOVERY_PORT")
@@ -161,23 +221,38 @@ class PhonectNetworkService : Service() {
                     try {
                         val buffer = ByteArray(1024)
                         val packet = DatagramPacket(buffer, buffer.size)
-                        discoverySocket?.receive(packet)
+                        localSocket?.receive(packet)
                         val payload = String(packet.data, 0, packet.length, Charsets.UTF_8).trim()
                         val discovery = parseDiscovery(payload) ?: continue
                         val sourceIp = packet.address.hostAddress ?: continue
                         val key = "${sourceIp}:${discovery.port}:${discovery.fp16}"
-                        if (!inFlightConnections.add(key)) {
+                        val eligible = synchronized(listenerLock) {
+                            listenJob === owner && owner.isActive && listenerDesired
+                        }
+                        if (!eligible) continue
+                        val attempt = attempts.claim(serviceScope, key) { attemptOwner ->
+                            try {
+                                connectAndHandleTcp(attemptOwner, packet.address, discovery.port, discovery.pcName, discovery.fp16)
+                            } catch (e: CancellationException) {
+                                LogManager.i(TAG, "Connection attempt cancelled for $key")
+                                throw e
+                            } catch (e: SocketTimeoutException) {
+                                LogManager.w(TAG, "Connection attempt timed out for $key")
+                            } catch (e: IOException) {
+                                if (!attemptOwner.owner.isActive) {
+                                    LogManager.i(TAG, "Connection attempt cancelled for $key")
+                                    throw CancellationException("attempt cancelled", e)
+                                }
+                                LogManager.w(TAG, "Connection attempt failed for $key: ${e.message}")
+                            }
+                        }
+                        if (attempt == null) {
                             LogManager.d(TAG, "Discovery already in-flight for $key")
                             continue
                         }
                         LogManager.i(TAG, "Discovery from ${discovery.pcName} at $sourceIp:${discovery.port}")
-                        launch {
-                            try {
-                                connectAndHandleTcp(packet.address, discovery.port, discovery.pcName, discovery.fp16)
-                            } finally {
-                                inFlightConnections.remove(key)
-                            }
-                        }
+                        LogManager.i(TAG, "Starting connection attempt for $key")
+                        attempts.start(attempt)
                     } catch (_: SocketTimeoutException) {
                         // Periodically wake so coroutine cancellation is observed.
                     } catch (e: IOException) {
@@ -191,20 +266,47 @@ class PhonectNetworkService : Service() {
                 updateNotification("Error: ${e.message ?: "unknown"}")
                 broadcastStatus("error")
             } finally {
-                try { discoverySocket?.close() } catch (_: Exception) {}
+                try { localSocket?.close() } catch (_: Exception) {}
+                synchronized(listenerLock) { if (discoverySocket === localSocket) discoverySocket = null }
                 LogManager.i(TAG, "Wi-Fi listener stopped")
                 updateNotification("Service stopped")
                 broadcastStatus("stopped")
             }
         }
+        val installed = synchronized(listenerLock) {
+            if (!listenerDesired || listenJob?.isActive == true) false else {
+                listenJob = owner
+                owner.invokeOnCompletion {
+                    synchronized(listenerLock) { if (listenJob === owner) listenJob = null }
+                }
+                true
+            }
+        }
+        if (!installed) {
+            owner.cancel()
+            return
+        }
+        owner.start()
     }
 
     private fun stopWifiListener() {
-        listenJob?.cancel()
-        try { discoverySocket?.close() } catch (_: Exception) {}
-        discoverySocket = null
+        cancelTransport("explicit stop")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    private fun cancelTransport(reason: String): Job? {
+        LogManager.i(TAG, "Cancelling discovery transport: $reason")
+        val (job, socket) = synchronized(listenerLock) {
+            val captured = listenJob to discoverySocket
+            listenJob = null
+            discoverySocket = null
+            captured
+        }
+        job?.cancel()
+        attempts.cancelAll()
+        try { socket?.close() } catch (_: Exception) { }
+        return job
     }
 
     // ------------------------------------------------------------------
@@ -221,12 +323,21 @@ class PhonectNetworkService : Service() {
         return Discovery(parts[1], parts[2], port)
     }
 
-    private suspend fun connectAndHandleTcp(address: InetAddress, port: Int, discoveredName: String, discoveredFp16: String) {
+    private suspend fun connectAndHandleTcp(
+        attempt: InFlightAttemptRegistry.Attempt<String>, address: InetAddress, port: Int,
+        discoveredName: String, discoveredFp16: String,
+    ) {
         withContext(Dispatchers.IO) {
-            Socket().use { socket ->
+            Socket().let { socket ->
+                attempts.attachSocket(attempt, socket)
+                if (attempt.owner.isCancelled) return@let
+                try {
                 socket.connect(InetSocketAddress(address, port), 5_000)
                 socket.soTimeout = 30_000
                 handleTcpConnection(socket, discoveredName, discoveredFp16, port)
+                } finally {
+                    socket.close()
+                }
             }
         }
     }
@@ -344,13 +455,20 @@ class PhonectNetworkService : Service() {
             val handler = BiometricHandler(activity)
             val signature = cryptoManager.getInitializedSignature()
             val cryptoObject = BiometricPrompt.CryptoObject(signature)
-            val authResult = handler.awaitAuthentication(
-                title = "Unlock ${trustedPc?.name ?: pcName}",
-                subtitle = "Scan fingerprint to unlock your PC",
-                cryptoObject = cryptoObject,
-            )
+            val authResult = try {
+                withTimeout(BIOMETRIC_TIMEOUT_MS) {
+                    handler.awaitAuthentication(
+                        title = "Unlock ${trustedPc?.name ?: pcName}",
+                        subtitle = "Scan fingerprint to unlock your PC",
+                        cryptoObject = cryptoObject,
+                    )
+                }
+            } catch (_: TimeoutCancellationException) {
+                LogManager.w(TAG, "Biometric authentication timed out after ${BIOMETRIC_TIMEOUT_MS / 1000}s")
+                return
+            }
             if (authResult == null) {
-                LogManager.w(TAG, "Biometric declined by user")
+                LogManager.w(TAG, "Biometric declined or cancelled")
                 return
             }
 
@@ -371,7 +489,14 @@ class PhonectNetworkService : Service() {
             ProtocolHandler.sendResponse(output, response)
             LogManager.i(TAG, "Response sent to PC")
 
+        } catch (e: CancellationException) {
+            LogManager.i(TAG, "TCP handshake cancelled")
+            throw e
         } catch (e: java.io.IOException) {
+            if (!currentCoroutineContext().isActive) {
+                LogManager.i(TAG, "TCP handshake cancelled during I/O")
+                throw CancellationException("TCP socket closed during cancellation", e)
+            }
             LogManager.e(TAG, "I/O error during TCP handshake", e)
         } catch (e: SecurityException) {
             LogManager.e(TAG, "Security constraint: ${e.message}")

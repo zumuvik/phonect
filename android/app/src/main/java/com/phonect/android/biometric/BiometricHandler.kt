@@ -2,12 +2,13 @@ package com.phonect.android.biometric
 
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
+import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import com.phonect.android.logging.LogManager
-import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.util.concurrent.Executors
+import kotlin.coroutines.resume
 
 /**
  * Wraps AndroidX [BiometricPrompt] and exposes a suspend function
@@ -89,9 +90,12 @@ class BiometricHandler(private val activity: FragmentActivity) {
         onSuccess: (BiometricPrompt.AuthenticationResult) -> Unit,
         onError: (errorCode: Int, errString: String) -> Unit = { _, _ -> },
     ) {
-        if (activity.isFinishing) return
+        if (activity.isFinishing || activity.isDestroyed) {
+            onError(BiometricPrompt.ERROR_CANCELED, "Activity is finishing or destroyed")
+            return
+        }
 
-        val executor = Executors.newSingleThreadExecutor()
+        val executor = ContextCompat.getMainExecutor(activity)
 
         val callback = object : BiometricPrompt.AuthenticationCallback() {
             override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
@@ -145,19 +149,29 @@ class BiometricHandler(private val activity: FragmentActivity) {
         subtitle: String = "Scan fingerprint to unlock your PC",
         cryptoObject: BiometricPrompt.CryptoObject,
     ): BiometricPrompt.AuthenticationResult? {
-        val deferred = CompletableDeferred<BiometricPrompt.AuthenticationResult?>()
-
-        withContext(Dispatchers.Main) {
-            promptAuthentication(
-                title = title,
-                subtitle = subtitle,
-                cryptoObject = cryptoObject,
-                onSuccess = { result -> deferred.complete(result) },
-                onError = { _, _ -> deferred.complete(null) },
-            )
+        return withContext(Dispatchers.Main.immediate) {
+            if (activity.isFinishing || activity.isDestroyed) return@withContext null
+            suspendCancellableCoroutine { continuation ->
+            val prompt = BiometricPrompt(activity, ContextCompat.getMainExecutor(activity),
+                object : BiometricPrompt.AuthenticationCallback() {
+                    override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                        if (continuation.isActive) continuation.resume(result)
+                    }
+                    override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                        if (continuation.isActive) continuation.resume(null)
+                    }
+                })
+            continuation.invokeOnCancellation {
+                ContextCompat.getMainExecutor(activity).execute { prompt.cancelAuthentication() }
+            }
+            val info = BiometricPrompt.PromptInfo.Builder()
+                .setTitle(title).setSubtitle(subtitle).setNegativeButtonText("Cancel")
+                .setConfirmationRequired(false)
+                .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+                .build()
+            if (continuation.isActive) prompt.authenticate(info, cryptoObject)
+            }
         }
-
-        return deferred.await()
     }
 }
 
