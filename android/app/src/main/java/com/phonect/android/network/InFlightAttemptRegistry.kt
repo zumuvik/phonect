@@ -34,7 +34,7 @@ internal class InFlightAttemptRegistry<K>(private val onCleared: (K) -> Unit = {
 
     fun attachSocket(attempt: Attempt<K>, socket: Closeable) {
         val rejected = synchronized(this) {
-            if (attempts[attempt.key] !== attempt || attempt.owner.isCancelled) true else {
+            if (attempts[attempt.key] !== attempt || attempt.cancelling || attempt.owner.isCancelled) true else {
                 attempt.socket = socket
                 false
             }

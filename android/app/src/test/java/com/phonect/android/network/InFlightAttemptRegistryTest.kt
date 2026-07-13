@@ -6,6 +6,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -88,19 +89,38 @@ class InFlightAttemptRegistryTest {
         assertNotNull(registry.claim(this, "bad") { }); assertNotNull(registry.claim(this, "good") { }); registry.cancelAll()
     }
 
-    @Test fun cancelAllKeepsKeyClaimedUntilOwnerIsCancelled() = runTest(dispatcher) {
+    @Test fun cancelAllKeepsKeyClaimedUntilOwnerIsCancelled() {
         val registry = InFlightAttemptRegistry<String>()
-        val owner = registry.claim(this, "pc") { kotlinx.coroutines.awaitCancellation() }!!
-        registry.start(owner); runCurrent()
+        val ownerScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val probeScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val retryScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val owner = registry.claim(ownerScope, "pc") { kotlinx.coroutines.awaitCancellation() }!!
+        registry.start(owner)
         val admittedDuringCancellation = AtomicInteger()
         owner.owner.invokeOnCompletion {
-            if (registry.claim(this, "pc") { } != null) admittedDuringCancellation.incrementAndGet()
+            registry.claim(probeScope, "pc") { }?.let {
+                admittedDuringCancellation.incrementAndGet()
+                it.owner.cancel()
+            }
         }
         registry.cancelAll()
         assertTrue(owner.owner.isCancelled)
         assertEquals(0, admittedDuringCancellation.get())
-        assertNotNull(registry.claim(this, "pc") { })
+        registry.claim(retryScope, "pc") { }?.owner?.cancel() ?: fail("retry was not admitted")
         registry.cancelAll()
+        ownerScope.cancel(); probeScope.cancel(); retryScope.cancel()
+    }
+
+    @Test fun attachSocketDuringCancelAllIsClosed() {
+        val registry = InFlightAttemptRegistry<String>()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val attempt = registry.claim(scope, "pc") { kotlinx.coroutines.awaitCancellation() }!!
+        val lateSocket = FlagCloseable()
+        attempt.owner.invokeOnCompletion { registry.attachSocket(attempt, lateSocket) }
+        registry.start(attempt)
+        registry.cancelAll()
+        assertTrue(lateSocket.closed)
+        scope.cancel()
     }
 
     private class FlagCloseable : Closeable { var closed = false; override fun close() { closed = true } }
