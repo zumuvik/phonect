@@ -1,6 +1,7 @@
 package com.phonect.android.network
 
 import com.google.gson.Gson
+import com.phonect.android.logging.LogManager
 import com.phonect.android.model.*
 import java.io.*
 import java.net.Socket
@@ -17,11 +18,15 @@ import java.nio.ByteBuffer
 
 object ProtocolHandler {
 
+    private const val TAG = "ProtocolHandler"
     @PublishedApi internal val gson = Gson()
 
     /** Encode any message into a length-prefixed frame. */
     fun encodeFrame(obj: Any): ByteArray {
-        val json = gson.toJson(obj)
+        return encodeJsonFrame(gson.toJson(obj))
+    }
+
+    private fun encodeJsonFrame(json: String): ByteArray {
         val payload = json.toByteArray(Charsets.UTF_8)
         val header = ByteBuffer.allocate(4).putInt(payload.size).array()
         return header + payload
@@ -83,7 +88,15 @@ object ProtocolHandler {
     }
 
     fun sendPairHello(outputStream: OutputStream, hello: PairHelloMessage) {
-        outputStream.write(encodeFrame(hello))
+        val json = gson.toJson(hello)
+        val frame = encodeJsonFrame(json)
+        val framePrefix = frame.take(16).joinToString(" ") { "%02x".format(it.toInt() and 0xff) }
+        LogManager.d(
+            TAG,
+            "Sending pair_hello json=$json payloadBytes=${frame.size - FRAME_HEADER_SIZE} " +
+                "frameBytes=${frame.size} framePrefix=$framePrefix",
+        )
+        outputStream.write(frame)
         outputStream.flush()
     }
 

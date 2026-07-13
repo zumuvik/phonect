@@ -344,7 +344,20 @@ class PhonectDaemon:
                 return False, False
 
             msg = await self._read_frame(reader, timeout=HANDSHAKE_TIMEOUT)
-            hello = validate_pair_hello(msg or {})
+            if isinstance(msg, dict):
+                LOG.debug(
+                    "Received pair_hello frame: type=%s repr=%r keys=%s message_type=%r",
+                    type(msg).__name__, msg, list(msg.keys()), msg.get("type"),
+                )
+            else:
+                LOG.debug(
+                    "Received pair_hello frame: type=%s repr=%r",
+                    type(msg).__name__, msg,
+                )
+                raise ProtocolError(
+                    f"pair_hello frame decoded as {type(msg).__name__}, expected dict"
+                )
+            hello = validate_pair_hello(msg)
             phone_pem = hello["public_key_pem"]
             phone_fp = hello["public_key_fingerprint"]
             device_name = hello.get("device_name", "phone")
