@@ -52,6 +52,8 @@ let
       listen_port = ${toString s.daemon.listen_port}
       poll_interval = ${toString s.daemon.poll_interval}
       poll_timeout = ${toString s.daemon.poll_timeout}
+      unlock_backend = "${s.daemon.unlock_backend}"
+      unlock_command = ${builtins.toJSON s.daemon.unlock_command}
 
       [logging]
       level = "${s.logging.level}"
@@ -121,6 +123,16 @@ in {
               default = 15.0;
               description = "Seconds the daemon keeps each wake/manual auth window open.";
             };
+            unlock_backend = lib.mkOption {
+              type = lib.types.enum [ "loginctl" "command" ];
+              default = "loginctl";
+              description = "Local unlock backend.";
+            };
+            unlock_command = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              description = "Static argv for the command unlock backend.";
+            };
           };
 
           logging = {
@@ -136,6 +148,17 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = cfg.settings.daemon.unlock_backend != "command"
+          || (cfg.settings.daemon.unlock_command != [ ] && builtins.match "[[:space:]]*" (builtins.head cfg.settings.daemon.unlock_command) == null);
+        message = "services.phonect.settings.daemon.unlock_command requires a nonblank executable for command.";
+      }
+      {
+        assertion = cfg.settings.daemon.unlock_backend != "loginctl" || cfg.settings.daemon.unlock_command == [ ];
+        message = "services.phonect.settings.daemon.unlock_command must be empty for loginctl.";
+      }
+    ];
     # ── Make the phonect CLI available in PATH ──────────────────────────
     environment.systemPackages = [ cfg.package ];
 

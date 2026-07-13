@@ -40,6 +40,50 @@
       };
       moduleConfig = nixos.config;
       configSource = moduleConfig.environment.etc."phonect/config.toml".source;
+      commandNixos = lib.nixosSystem {
+        inherit system;
+        modules = [
+          ./phonect-service.nix
+          {
+            system.stateVersion = "25.05";
+            services.phonect = {
+              enable = true;
+              settings.daemon = {
+                unlock_backend = "command";
+                unlock_command = [ "${pkgs.coreutils}/bin/true" "space arg" "quote\"arg" "back\\slash" ];
+              };
+            };
+          }
+        ];
+      };
+      commandConfigSource = commandNixos.config.environment.etc."phonect/config.toml".source;
+      invalidCommandEmpty = lib.nixosSystem {
+        inherit system;
+        modules = [ ./phonect-service.nix {
+          system.stateVersion = "25.05";
+          services.phonect.enable = true;
+          services.phonect.settings.daemon = { unlock_backend = "command"; unlock_command = [ ]; };
+        } ];
+      };
+      invalidCommandBlank = lib.nixosSystem {
+        inherit system;
+        modules = [ ./phonect-service.nix {
+          system.stateVersion = "25.05";
+          services.phonect.enable = true;
+          services.phonect.settings.daemon = { unlock_backend = "command"; unlock_command = [ "   " ]; };
+        } ];
+      };
+      invalidLoginctlArgv = lib.nixosSystem {
+        inherit system;
+        modules = [ ./phonect-service.nix {
+          system.stateVersion = "25.05";
+          services.phonect.enable = true;
+          services.phonect.settings.daemon = { unlock_backend = "loginctl"; unlock_command = [ "/bin/true" ]; };
+        } ];
+      };
+      invalidCommandEmptyEval = builtins.tryEval invalidCommandEmpty.config.system.build.toplevel.drvPath;
+      invalidCommandBlankEval = builtins.tryEval invalidCommandBlank.config.system.build.toplevel.drvPath;
+      invalidLoginctlArgvEval = builtins.tryEval invalidLoginctlArgv.config.system.build.toplevel.drvPath;
       testPython = pkgs.python3.withPackages (ps: [
         package
         ps.pytest
@@ -69,7 +113,29 @@
             grep -Fx 'listen_port = 9876' "$configSource"
             grep -Fx 'poll_interval = 0.300000' "$configSource"
             grep -Fx 'poll_timeout = 15.000000' "$configSource"
+            grep -Fx 'unlock_backend = "loginctl"' "$configSource"
+            grep -Fx 'unlock_command = []' "$configSource"
             grep -Fx 'level = "INFO"' "$configSource"
+            touch "$out"
+          '';
+
+        command-module = assert !invalidCommandEmptyEval.success;
+          assert !invalidCommandBlankEval.success;
+          assert !invalidLoginctlArgvEval.success;
+          pkgs.runCommand "phonect-command-module-evaluation" {
+            inherit commandConfigSource;
+            expectedExecutable = "${pkgs.coreutils}/bin/true";
+            nativeBuildInputs = [ package ];
+          } ''
+            test -f "$commandConfigSource"
+            python - "$commandConfigSource" "$expectedExecutable" <<'PY'
+            import sys
+            from phonect.config import load_config
+
+            config = load_config(__import__("pathlib").Path(sys.argv[1]))
+            assert config.unlock_backend == "command"
+            assert config.unlock_command == [sys.argv[2], "space arg", 'quote"arg', "back\\slash"]
+            PY
             touch "$out"
           '';
 

@@ -121,6 +121,8 @@ listen_host = "0.0.0.0"
 listen_port = 9876
 poll_interval = 0.3
 poll_timeout = 15.0
+unlock_backend = "loginctl"
+unlock_command = []
 
 [keys]
 private_key = "/home/user/.config/phonect/pc_private.pem"
@@ -157,7 +159,13 @@ python scripts/e2e_cli_test.py
 3. Подписывается на `org.freedesktop.login1.Manager.PrepareForSleep` через system D-Bus.
 4. При resume (`PrepareForSleep=false`) открывает ограниченное auth window.
 5. Во время auth window отправляет UDP discovery и принимает одно TCP authentication-соединение.
-6. При успешной проверке закреплённого ключа вызывает `loginctl unlock-session` для активных сессий пользователя.
+6. При успешной проверке закреплённого ключа запускает выбранный локальный unlock backend.
+
+### Unlock backend
+
+По умолчанию `unlock_backend = "loginctl"` разблокирует активные сессии. Для локального hook используйте `unlock_backend = "command"` и статический `unlock_command = ["/path/to/program", "arg"]`; для `loginctl` список должен быть пустым. Аргументы запускаются без shell, expansion, fallback или auto-package detection и только после успешной аутентификации уже закреплённого ключа.
+
+В NixOS те же опции находятся в `services.phonect.settings.daemon.unlock_backend` и `unlock_command`.
 
 Дополнительно:
 
@@ -203,12 +211,17 @@ Android app находится в `android/` и собирается Gradle/JDK 
       daemon.listen_port = 9876;
       daemon.poll_interval = 0.3;
       daemon.poll_timeout = 15.0;
+      # Default is "loginctl" with an empty unlock_command.
+      daemon.unlock_backend = "command";
+      daemon.unlock_command = [ "/run/current-system/sw/bin/my-hook" "arg" ];
 
       logging.level = "INFO";
     };
   };
 }
 ```
+
+`unlock_command` — статический список argv для backend `command`; backend `loginctl` требует пустой список. Не помещайте секреты в `unlock_command`: Nix-генерируемый `/etc/phonect/config.toml` доступен для чтения всем пользователям.
 
 Модуль:
 

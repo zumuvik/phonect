@@ -18,7 +18,7 @@ from typing import List, Optional
 
 import pytest
 
-from phonect.config import DaemonConfig, load_config, write_default_config
+from phonect.config import DaemonConfig, load_config, validate_unlock_config, write_default_config
 from phonect.crypto import generate_key_pair, fingerprint_from_public_key, public_key_to_pem, sign_nonce
 from phonect.daemon import PhonectDaemon
 from phonect.handshake import HandshakeClient
@@ -30,6 +30,33 @@ from phonect.protocol import encode_frame, make_pair_hello, make_response, valid
 # ======================================================================
 
 class TestConfig:
+    @pytest.mark.parametrize("backend,command", [
+        ("unknown", []), ("command", []), ("command", ["   "]), ("loginctl", ["ignored"]),
+    ])
+    def test_rejects_invalid_unlock_backend_config(self, backend, command):
+        with pytest.raises(ValueError):
+            validate_unlock_config(DaemonConfig(unlock_backend=backend, unlock_command=command))
+
+    def test_loads_command_unlock_backend(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text('[daemon]\nunlock_backend = "command"\nunlock_command = ["/bin/echo", "a b"]\n')
+        cfg = load_config(path)
+        assert cfg.unlock_backend == "command"
+        assert cfg.unlock_command == ["/bin/echo", "a b"]
+
+    @pytest.mark.parametrize("contents", [
+        '[daemon]\nunlock_backend = "unknown"\n',
+        '[daemon]\nunlock_backend = "command"\nunlock_command = "echo nope"\n',
+        '[daemon]\nunlock_backend = "command"\nunlock_command = ["/bin/echo", 1]\n',
+        '[daemon]\nunlock_backend = "command"\nunlock_command = []\n',
+        '[daemon]\nunlock_backend = "loginctl"\nunlock_command = ["/bin/echo"]\n',
+    ])
+    def test_load_config_rejects_invalid_unlock_settings(self, tmp_path, contents):
+        path = tmp_path / "config.toml"
+        path.write_text(contents)
+        with pytest.raises(ValueError):
+            load_config(path)
+
     def test_default_config_returns_minimal(self):
         """load_config() with no file returns defaults (no keys)."""
         cfg = load_config(Path("/nonexistent/config.toml"))
@@ -52,7 +79,11 @@ class TestConfig:
             assert cfg.listen_port == 9876
             assert cfg.poll_interval == 0.3
             assert cfg.poll_timeout == 15.0
+            assert cfg.unlock_backend == "loginctl"
+            assert cfg.unlock_command == []
             assert cfg.log_level == "INFO"
+            assert 'unlock_backend = "loginctl"' in path.read_text()
+            assert "unlock_command = []" in path.read_text()
         finally:
             path.unlink(missing_ok=True)
 
@@ -191,6 +222,43 @@ class TestDaemonUnlockHook:
         assert "loginctl" in captured[0]
         assert "unlock-session" in captured[0]
 
+    def test_command_runs_static_argv_once(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: calls.append((args, kwargs)) or __import__("subprocess").CompletedProcess(args, 0, "", ""))
+        daemon = PhonectDaemon(DaemonConfig(unlock_backend="command", unlock_command=["/bin/echo", "a b", "$(nope)"]))
+        daemon._unlock_sessions()
+        assert calls == [
+            ((["/bin/echo", "a b", "$(nope)"],), {"shell": False, "capture_output": True, "text": True, "timeout": 5, "errors": "replace"}),
+        ]
+
+    def test_invalid_direct_command_logs_and_does_not_execute(self, monkeypatch, caplog):
+        monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: pytest.fail("must not run"))
+        with caplog.at_level(logging.ERROR):
+            PhonectDaemon(DaemonConfig(unlock_backend="command", unlock_command=[]))._unlock_sessions()
+        assert "Invalid unlock backend configuration" in caplog.text
+
+    @pytest.mark.parametrize("failure, expected", [
+        (lambda: __import__("subprocess").CompletedProcess([], 7, "secret stdout", "secret stderr"), "Unlock command failed with status 7"),
+        (lambda: __import__("subprocess").TimeoutExpired(["/bin/hook"], 5, output="secret stdout", stderr="secret stderr"), "Unlock command timed out after 5 seconds"),
+        (lambda: FileNotFoundError("secret missing"), "Unlock command executable not found"),
+        (lambda: OSError(errno.EACCES, "secret os error"), "Unlock command failed with OSError"),
+    ])
+    def test_command_failures_are_safe(self, monkeypatch, caplog, failure, expected):
+        secret = "super-secret-argument"
+        def fake_run(*args, **kwargs):
+            outcome = failure()
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+        monkeypatch.setattr("subprocess.run", fake_run)
+        daemon = PhonectDaemon(DaemonConfig(unlock_backend="command", unlock_command=["/bin/hook", secret]))
+        with caplog.at_level(logging.INFO):
+            daemon._unlock_sessions()
+        assert expected in caplog.text
+        assert secret not in caplog.text
+        assert "secret stdout" not in caplog.text
+        assert "secret stderr" not in caplog.text
+
 
 # ======================================================================
 # Async: handshake via daemon's _async_handshake (legacy test helper)
@@ -277,11 +345,13 @@ class TestDaemonTcpPairing:
         with tempfile.TemporaryDirectory() as tmp:
             trusted = Path(tmp) / "trusted_device.pub"
             priv = Path(tmp) / "pc_private.pem"; priv.write_bytes(pc_kp.private_key_pem)
-            cfg = DaemonConfig(private_key_path=priv, public_key_path=trusted, listen_host="127.0.0.1", listen_port=0)
+            cfg = DaemonConfig(
+                private_key_path=priv, public_key_path=trusted, listen_host="127.0.0.1", listen_port=0,
+                unlock_backend="command", unlock_command=["/bin/true"],
+            )
             daemon = PhonectDaemon(cfg)
             daemon._auth_pending = True
             unlocks = []
-            monkeypatch.setattr(daemon, "_get_active_session_ids", lambda: ["2"])
             daemon._unlock_hook = lambda cmd: unlocks.append(cmd)
             server = await asyncio.start_server(daemon._handle_client, "127.0.0.1", 0)
             host, port = server.sockets[0].getsockname()
@@ -294,6 +364,7 @@ class TestDaemonTcpPairing:
                 await self._phone(host, port, mobile_kp)
                 await daemon._auth_completed.wait()
                 assert len(unlocks) == 1
+                assert unlocks == [["/bin/true"]]
             finally:
                 server.close(); await server.wait_closed()
 

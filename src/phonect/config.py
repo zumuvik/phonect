@@ -57,6 +57,8 @@ class DaemonConfig:
     listen_port: int = field(default=9876)
     poll_interval: float = field(default=0.3)
     poll_timeout: float = field(default=15.0)
+    unlock_backend: str = field(default="loginctl")
+    unlock_command: list[str] = field(default_factory=list)
 
     # Logging
     log_level: str = field(default="INFO")
@@ -106,6 +108,19 @@ def _default_config_dir() -> Path:
 def default_config_path() -> Path:
     """Return the default config file path."""
     return _default_config_dir() / CONFIG_FILE_NAME
+
+
+def validate_unlock_config(config: DaemonConfig) -> None:
+    """Validate the closed set of local unlock-backend settings."""
+    if not isinstance(config.unlock_backend, str) or config.unlock_backend not in {"loginctl", "command"}:
+        raise ValueError("daemon.unlock_backend must be 'loginctl' or 'command'")
+    if not isinstance(config.unlock_command, list) or not all(isinstance(arg, str) for arg in config.unlock_command):
+        raise ValueError("daemon.unlock_command must be a list of strings")
+    if config.unlock_backend == "command":
+        if not config.unlock_command or not config.unlock_command[0].strip():
+            raise ValueError("daemon.unlock_command requires a nonblank executable for the command backend")
+    elif config.unlock_command:
+        raise ValueError("daemon.unlock_command must be empty for the loginctl backend")
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +177,8 @@ def load_config(path: Optional[Path] = None) -> DaemonConfig:
     base.listen_port = int(daemon.get("listen_port", base.listen_port))
     base.poll_interval = float(daemon.get("poll_interval", base.poll_interval))
     base.poll_timeout = float(daemon.get("poll_timeout", base.poll_timeout))
+    base.unlock_backend = daemon.get("unlock_backend", base.unlock_backend)
+    base.unlock_command = daemon.get("unlock_command", base.unlock_command)
     base.pc_name = daemon.get("pc_name", base.pc_name)
     base.unlock_on_start = daemon.get("unlock_on_start", base.unlock_on_start)
 
@@ -169,6 +186,7 @@ def load_config(path: Optional[Path] = None) -> DaemonConfig:
     logging_ = data.get("logging", {})
     base.log_level = logging_.get("level", base.log_level)
 
+    validate_unlock_config(base)
     return base
 
 
@@ -195,6 +213,9 @@ listen_port = 9876
 poll_interval = 0.3
 # Maximum seconds to advertise and accept one TCP auth after wake/manual/start
 poll_timeout = 15.0
+# Unlock active sessions with loginctl, or run one static local command argv.
+unlock_backend = "loginctl"
+unlock_command = []
 
 [keys]
 # Path to the PC's own private key (PEM) — generate with: phonect gen-keys

@@ -28,7 +28,7 @@ import subprocess
 from pathlib import Path
 from typing import Callable, List, Optional
 
-from phonect.config import DaemonConfig, load_config, UDP_DISCOVERY_PORT
+from phonect.config import DaemonConfig, load_config, validate_unlock_config, UDP_DISCOVERY_PORT
 from phonect.crypto import (
     generate_nonce,
     load_public_key,
@@ -592,7 +592,19 @@ class PhonectDaemon:
     # ------------------------------------------------------------------
 
     def _unlock_sessions(self) -> None:
-        """Unlock all active sessions for the current user."""
+        """Dispatch the configured unlock backend after successful authentication."""
+        try:
+            validate_unlock_config(self.config)
+        except ValueError as exc:
+            LOG.error("Invalid unlock backend configuration: %s", exc)
+            return
+        if self.config.unlock_backend == "command":
+            self._unlock_command()
+        else:
+            self._unlock_loginctl_sessions()
+
+    def _unlock_loginctl_sessions(self) -> None:
+        """Unlock all active sessions for the current user via loginctl."""
         session_ids = self._get_active_session_ids()
         if not session_ids:
             LOG.warning("No active session found for user %s", os.environ.get("USER", "?"))
@@ -600,10 +612,10 @@ class PhonectDaemon:
 
         for sid in session_ids:
             cmd = ["loginctl", "unlock-session", sid]
-            LOG.info("Running: %s", " ".join(cmd))
+            LOG.info("Running loginctl unlock-session for session %s", sid)
 
             if self._unlock_hook:
-                self._unlock_hook(cmd)
+                self._unlock_hook(list(cmd))
                 continue
 
             try:
@@ -624,6 +636,30 @@ class PhonectDaemon:
                 LOG.error("loginctl timed out for session %s", sid)
             except FileNotFoundError:
                 LOG.error("loginctl not found — is systemd installed?")
+
+    def _unlock_command(self) -> None:
+        """Run the configured static command once without a shell."""
+        argv = list(self.config.unlock_command)
+        executable = argv[0]
+        if self._unlock_hook:
+            self._unlock_hook(list(argv))
+            return
+        try:
+            LOG.info("Running unlock command executable: %s", executable)
+            result = subprocess.run(
+                list(argv), shell=False, capture_output=True, text=True, timeout=5,
+                errors="replace",
+            )
+            if result.returncode == 0:
+                LOG.info("Unlock command completed successfully")
+            else:
+                LOG.warning("Unlock command failed with status %s", result.returncode)
+        except subprocess.TimeoutExpired:
+            LOG.error("Unlock command timed out after 5 seconds")
+        except FileNotFoundError:
+            LOG.error("Unlock command executable not found")
+        except OSError:
+            LOG.error("Unlock command failed with OSError")
 
     def _get_active_session_ids(self) -> List[str]:
         """Get active session IDs for the current user on seat0."""
