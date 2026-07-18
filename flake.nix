@@ -15,8 +15,10 @@
           ./phonect-service.nix
           {
             system.stateVersion = "25.05";
+            users.users.testuser.isNormalUser = true;
             services.phonect = {
               enable = true;
+              user = "testuser";
               settings = {
                 keys = {
                   public_key = "/etc/phonect/trusted_device.pub";
@@ -46,8 +48,10 @@
           ./phonect-service.nix
           {
             system.stateVersion = "25.05";
+            users.users.testuser.isNormalUser = true;
             services.phonect = {
               enable = true;
+              user = "testuser";
               settings.daemon = {
                 unlock_backend = "command";
                 unlock_command = [ "${pkgs.coreutils}/bin/true" "space arg" "quote\"arg" "back\\slash" ];
@@ -61,7 +65,9 @@
         inherit system;
         modules = [ ./phonect-service.nix {
           system.stateVersion = "25.05";
+          users.users.testuser.isNormalUser = true;
           services.phonect.enable = true;
+          services.phonect.user = "testuser";
           services.phonect.settings.daemon = { unlock_backend = "command"; unlock_command = [ ]; };
         } ];
       };
@@ -69,7 +75,9 @@
         inherit system;
         modules = [ ./phonect-service.nix {
           system.stateVersion = "25.05";
+          users.users.testuser.isNormalUser = true;
           services.phonect.enable = true;
+          services.phonect.user = "testuser";
           services.phonect.settings.daemon = { unlock_backend = "command"; unlock_command = [ "   " ]; };
         } ];
       };
@@ -77,13 +85,41 @@
         inherit system;
         modules = [ ./phonect-service.nix {
           system.stateVersion = "25.05";
+          users.users.testuser.isNormalUser = true;
           services.phonect.enable = true;
+          services.phonect.user = "testuser";
           services.phonect.settings.daemon = { unlock_backend = "loginctl"; unlock_command = [ "/bin/true" ]; };
+        } ];
+      };
+      invalidMissingUser = lib.nixosSystem {
+        inherit system;
+        modules = [ ./phonect-service.nix {
+          system.stateVersion = "25.05";
+          services.phonect.enable = true;
+        } ];
+      };
+      invalidUnknownUser = lib.nixosSystem {
+        inherit system;
+        modules = [ ./phonect-service.nix {
+          system.stateVersion = "25.05";
+          users.users.testuser.isNormalUser = true;
+          services.phonect = { enable = true; user = "unknown"; };
+        } ];
+      };
+      invalidNonNormalUser = lib.nixosSystem {
+        inherit system;
+        modules = [ ./phonect-service.nix {
+          system.stateVersion = "25.05";
+          users.users.testuser.isNormalUser = false;
+          services.phonect = { enable = true; user = "testuser"; };
         } ];
       };
       invalidCommandEmptyEval = builtins.tryEval invalidCommandEmpty.config.system.build.toplevel.drvPath;
       invalidCommandBlankEval = builtins.tryEval invalidCommandBlank.config.system.build.toplevel.drvPath;
       invalidLoginctlArgvEval = builtins.tryEval invalidLoginctlArgv.config.system.build.toplevel.drvPath;
+      invalidMissingUserEval = builtins.tryEval invalidMissingUser.config.system.build.toplevel.drvPath;
+      invalidUnknownUserEval = builtins.tryEval invalidUnknownUser.config.system.build.toplevel.drvPath;
+      invalidNonNormalUserEval = builtins.tryEval invalidNonNormalUser.config.system.build.toplevel.drvPath;
       testPython = pkgs.python3.withPackages (ps: [
         package
         ps.pytest
@@ -100,6 +136,7 @@
         module = assert moduleConfig.services.phonect.package.drvPath == package.drvPath;
           assert moduleConfig.systemd.user.services.phonect.serviceConfig.ExecStart
             == "${package}/bin/phonect daemon --config /etc/phonect/config.toml";
+          assert moduleConfig.systemd.user.services.phonect.unitConfig.ConditionUser == "testuser";
           assert lib.elem package moduleConfig.environment.systemPackages;
           assert moduleConfig.networking.firewall.allowedTCPPorts == [ 9876 ];
           assert moduleConfig.networking.firewall.allowedUDPPorts == [ 9875 ];
@@ -122,6 +159,9 @@
         command-module = assert !invalidCommandEmptyEval.success;
           assert !invalidCommandBlankEval.success;
           assert !invalidLoginctlArgvEval.success;
+          assert !invalidMissingUserEval.success;
+          assert !invalidUnknownUserEval.success;
+          assert !invalidNonNormalUserEval.success;
           pkgs.runCommand "phonect-command-module-evaluation" {
             inherit commandConfigSource;
             expectedExecutable = "${pkgs.coreutils}/bin/true";

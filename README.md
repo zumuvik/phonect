@@ -98,7 +98,10 @@ nix flake check path:. --no-write-lock-file --print-build-logs
       modules = [
         phonect.nixosModules.default
         {
-          services.phonect.enable = true;
+          services.phonect = {
+            enable = true;
+            user = "user";
+          };
         }
       ];
     };
@@ -111,6 +114,7 @@ nix flake check path:. --no-write-lock-file --print-build-logs
 ```nix
 services.phonect = {
   enable = true;
+  user = "user";
   settings = {
     keys = {
       private_key = "/home/user/.config/phonect/pc_private.pem";
@@ -136,7 +140,7 @@ services.phonect = {
 };
 ```
 
-Модуль создаёт `/etc/phonect/config.toml`, добавляет пакет в `environment.systemPackages`, открывает TCP-порт daemon и UDP `9875`, затем запускает user service:
+Модуль создаёт `/etc/phonect/config.toml`, добавляет пакет в `environment.systemPackages`, открывает TCP-порт daemon и UDP `9875`, затем запускает user service только в systemd user manager указанного нормального пользователя (`user`):
 
 ```text
 phonect daemon --config /etc/phonect/config.toml

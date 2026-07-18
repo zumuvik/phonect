@@ -6,6 +6,7 @@
 #
 #   services.phonect = {
 #     enable = true;
+#     user = "my-user";
 #     settings = {
 #       keys.public_key = "/home/zumuvik/.config/phonect/trusted_device.pub";
 #       keys.private_key = "/home/zumuvik/.config/phonect/pc_private.pem";
@@ -69,6 +70,12 @@ in {
       default = phonectPackage;
       defaultText = lib.literalExpression "phonect package";
       description = "The phonect Python package derivation.";
+    };
+
+    user = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Normal user whose systemd user manager runs phonect.";
     };
 
     settings = lib.mkOption {
@@ -150,6 +157,19 @@ in {
   config = lib.mkIf cfg.enable {
     assertions = [
       {
+        assertion = cfg.user != null;
+        message = "services.phonect.user must be configured when phonect is enabled.";
+      }
+      {
+        assertion = cfg.user == null || builtins.hasAttr cfg.user config.users.users;
+        message = "services.phonect.user must name a configured user.";
+      }
+      {
+        assertion = cfg.user == null || !(builtins.hasAttr cfg.user config.users.users)
+          || config.users.users.${cfg.user}.isNormalUser;
+        message = "services.phonect.user must name a normal user.";
+      }
+      {
         assertion = cfg.settings.daemon.unlock_backend != "command"
           || (cfg.settings.daemon.unlock_command != [ ] && builtins.match "[[:space:]]*" (builtins.head cfg.settings.daemon.unlock_command) == null);
         message = "services.phonect.settings.daemon.unlock_command requires a nonblank executable for command.";
@@ -172,6 +192,7 @@ in {
     # ── User service (runs on login, not as root) ───────────────────────
     systemd.user.services.phonect = {
       description = "phonect P2P Biometric Laptop Unlock Daemon";
+      unitConfig.ConditionUser = cfg.user;
       after = [
         "network.target"
         "suspend.target"
