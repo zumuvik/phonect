@@ -21,7 +21,7 @@ android {
         minSdk = 28          // Android 9 — BiometricPrompt available
         targetSdk = 34
         versionCode = 10
-        versionName = "0.4.7.2"
+        versionName = "0.4.8"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -36,6 +36,10 @@ android {
     }
 
     buildTypes {
+        getByName("debug") {
+            applicationIdSuffix = ".debug"
+        }
+
         release {
             isMinifyEnabled = true
             if (hasReleaseSigning) signingConfig = signingConfigs.getByName("release")
