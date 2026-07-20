@@ -21,7 +21,7 @@ android {
         minSdk = 28          // Android 9 — BiometricPrompt available
         targetSdk = 34
         versionCode = 10
-        versionName = "0.4.9"
+        versionName = "0.4.10"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
