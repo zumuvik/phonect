@@ -1,6 +1,6 @@
 package com.phonect.android.model
 
-import android.os.Build
+import com.google.gson.annotations.SerializedName
 
 /**
  * Wire-format messages — mirrors phonect.protocol on the Python side.
@@ -30,30 +30,30 @@ const val MSG_PAIR_ACCEPT = "pair_accept"
 
 /** Incoming challenge from PC. */
 data class ChallengeMessage(
-    val version: Int = PROTOCOL_VERSION,
-    val type: String = MSG_CHALLENGE,
-    val session_id: String = "",
-    val nonce: String = "",                       // hex-encoded 32 bytes
-    val pc_key_fingerprint: String? = null,        // mutual auth
-    val pc_signature: String? = null,              // mutual auth
+    @SerializedName("version") val version: Int = PROTOCOL_VERSION,
+    @SerializedName("type") val type: String = MSG_CHALLENGE,
+    @SerializedName("session_id") val session_id: String = "",
+    @SerializedName("nonce") val nonce: String = "",                       // hex-encoded 32 bytes
+    @SerializedName("pc_key_fingerprint") val pc_key_fingerprint: String? = null, // mutual auth
+    @SerializedName("pc_signature") val pc_signature: String? = null,       // mutual auth
 )
 
 /** Outgoing signed response from phone. */
 data class ResponseMessage(
-    val version: Int = PROTOCOL_VERSION,
-    val type: String = MSG_RESPONSE,
-    val session_id: String = "",
-    val signature: String = "",                    // hex-encoded RSA-4096 PSS/SHA-512 sig
-    val public_key_fingerprint: String = "",
-    val device_name: String = "android-phone",
+    @SerializedName("version") val version: Int = PROTOCOL_VERSION,
+    @SerializedName("type") val type: String = MSG_RESPONSE,
+    @SerializedName("session_id") val session_id: String = "",
+    @SerializedName("signature") val signature: String = "",                    // hex-encoded RSA-4096 PSS/SHA-512 sig
+    @SerializedName("public_key_fingerprint") val public_key_fingerprint: String = "",
+    @SerializedName("device_name") val device_name: String = "android-phone",
 )
 
 /** Error message (either direction). */
 data class ErrorMessage(
-    val version: Int = PROTOCOL_VERSION,
-    val type: String = MSG_ERROR,
-    val session_id: String = "",
-    val reason: String = "",
+    @SerializedName("version") val version: Int = PROTOCOL_VERSION,
+    @SerializedName("type") val type: String = MSG_ERROR,
+    @SerializedName("session_id") val session_id: String = "",
+    @SerializedName("reason") val reason: String = "",
 )
 
 /**
@@ -63,12 +63,12 @@ data class ErrorMessage(
  * pairing (Trust On First Use).
  */
 data class PairHelloMessage(
-    val version: Int = PROTOCOL_VERSION,
-    val type: String = MSG_PAIR_HELLO,
-    val session_id: String = "",
-    val public_key_pem: String = "",
-    val public_key_fingerprint: String = "",
-    val device_name: String = "",
+    @SerializedName("version") val version: Int = PROTOCOL_VERSION,
+    @SerializedName("type") val type: String = MSG_PAIR_HELLO,
+    @SerializedName("session_id") val session_id: String = "",
+    @SerializedName("public_key_pem") val public_key_pem: String = "",
+    @SerializedName("public_key_fingerprint") val public_key_fingerprint: String = "",
+    @SerializedName("device_name") val device_name: String = "",
 )
 
 /**
@@ -77,11 +77,11 @@ data class PairHelloMessage(
  * Carries the sender's RSA public key so the peer can store it.
  */
 data class PairAcceptMessage(
-    val version: Int = PROTOCOL_VERSION,
-    val type: String = MSG_PAIR_ACCEPT,
-    val session_id: String = "",
-    val public_key_pem: String = "",
-    val public_key_fingerprint: String = "",
+    @SerializedName("version") val version: Int = PROTOCOL_VERSION,
+    @SerializedName("type") val type: String = MSG_PAIR_ACCEPT,
+    @SerializedName("session_id") val session_id: String = "",
+    @SerializedName("public_key_pem") val public_key_pem: String = "",
+    @SerializedName("public_key_fingerprint") val public_key_fingerprint: String = "",
 )
 
 /** Paired PC record — persisted in shared preferences. */
